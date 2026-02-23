@@ -1,4 +1,15 @@
+//! Default tokenizer — a standard text analysis pipeline using Tantivy's
+//! built-in filters.
+//!
+//! Pipeline: Whitespace -> ASCII folding -> lowercase -> stop words -> stemmer.
+//!
+//! This is a simpler alternative to the compound tokenizer, suitable for
+//! general-purpose text fields that don't need WORD/COMPLEX classification
+//! or n-gram expansion. Also provides shared helpers (`get_stemmer_lang`,
+//! `get_stop_words`, `get_strip_chars`) used by other tokenizer types.
+
 use magnus::{Error, RHash, Symbol};
+use rust_stemmers::Algorithm;
 use tantivy::tokenizer::*;
 use tantivy::Index;
 
@@ -54,6 +65,50 @@ pub fn get_stemmer_lang(kwargs: &RHash) -> Result<Language, Error> {
         None => Language::English,
     };
     Ok(lang)
+}
+
+/// Parse the `stemmer:` option into a `rust_stemmers::Algorithm`. Defaults to English.
+///
+/// Shared by the compound index and query tokenizers which use `rust_stemmers`
+/// directly (unlike the default tokenizer which uses Tantivy's built-in `Stemmer`).
+///
+/// Supported languages: `:english`, `:french`, `:german`, `:spanish`, `:italian`,
+/// `:portuguese`, `:dutch`, `:swedish`, `:norwegian`, `:danish`, `:finnish`,
+/// `:hungarian`, `:romanian`, `:russian`, `:turkish`.
+pub fn get_stemmer_algorithm(kwargs: &RHash) -> Result<Algorithm, Error> {
+    let algo = match kwargs.get(Symbol::new("stemmer")) {
+        Some(val) => {
+            let sym: Symbol = magnus::TryConvert::try_convert(val)?;
+            let name = sym.name().map_err(|e| {
+                Error::new(magnus::exception::runtime_error(), format!("{}", e))
+            })?.to_string();
+            match name.to_lowercase().as_str() {
+                "english" => Algorithm::English,
+                "french" => Algorithm::French,
+                "german" => Algorithm::German,
+                "spanish" => Algorithm::Spanish,
+                "italian" => Algorithm::Italian,
+                "portuguese" => Algorithm::Portuguese,
+                "dutch" => Algorithm::Dutch,
+                "swedish" => Algorithm::Swedish,
+                "norwegian" => Algorithm::Norwegian,
+                "danish" => Algorithm::Danish,
+                "finnish" => Algorithm::Finnish,
+                "hungarian" => Algorithm::Hungarian,
+                "romanian" => Algorithm::Romanian,
+                "russian" => Algorithm::Russian,
+                "turkish" => Algorithm::Turkish,
+                _ => {
+                    return Err(Error::new(
+                        magnus::exception::arg_error(),
+                        format!("Unknown stemmer language: {}", name),
+                    ))
+                }
+            }
+        }
+        None => Algorithm::English,
+    };
+    Ok(algo)
 }
 
 /// Parse the `stop_words:` option. Accepts a language symbol or array of strings.

@@ -1,53 +1,47 @@
-/// Query-side compound tokenizer.
-///
-/// Ported from Java's PatentSafeQueryAnalyser pipeline:
-///   Whitespace → ASCIIFold → SkippingPunctuationStop → PreOrPostPunctuationStrip
-///   → LowerCase → StopWords → Stemmer
-///
-/// Unlike the index tokenizer, this does NOT do WORD/COMPLEX classification or n-gram
-/// expansion. It's a simpler pipeline that cleans up query text to match indexed tokens.
+//! Query-side compound tokenizer.
+//!
+//! Ported from Java's PatentSafeQueryAnalyser pipeline:
+//!   Whitespace -> ASCIIFold -> SkippingPunctuationStop -> PreOrPostPunctuationStrip
+//!   -> LowerCase -> StopWords -> Stemmer
+//!
+//! Unlike the index tokenizer, this does NOT do WORD/COMPLEX classification or
+//! n-gram expansion. It's a simpler pipeline that cleans up query text to match
+//! indexed tokens. Wildcards (`*`, `?`) and quotes (`"`) are preserved through
+//! the pipeline for phrase and wildcard query support.
 
-use magnus::{Error, RHash, Symbol};
+use magnus::Error;
 use rust_stemmers::{Algorithm, Stemmer};
 use tantivy::tokenizer::*;
 use tantivy::Index;
 
 use super::stop_words::is_stop_word;
 
+/// Build and register the compound query tokenizer from Ruby keyword arguments.
+///
+/// Reads `stemmer:` and `stop_words:` from the kwargs hash. Unlike the index
+/// tokenizer, no `leading_strip:`/`trailing_strip:` — the query tokenizer uses
+/// its own punctuation rules that preserve wildcards (`*`, `?`) and quotes.
 pub fn register_query_tokenizer(
     index: &Index,
     name: &str,
-    kwargs: &RHash,
+    kwargs: &magnus::RHash,
 ) -> Result<(), Error> {
     let stop_words_list = crate::tokenizer::default::get_stop_words(kwargs)?;
-
-    let stemmer_algo = match kwargs.get(Symbol::new("stemmer")) {
-        Some(val) => {
-            let sym: Symbol = magnus::TryConvert::try_convert(val)?;
-            let name = sym
-                .name()
-                .map_err(|e| Error::new(magnus::exception::runtime_error(), format!("{}", e)))?
-                .to_string();
-            match name.to_lowercase().as_str() {
-                "english" => Algorithm::English,
-                "french" => Algorithm::French,
-                "german" => Algorithm::German,
-                _ => {
-                    return Err(Error::new(
-                        magnus::exception::arg_error(),
-                        format!("Unknown stemmer language: {}", name),
-                    ))
-                }
-            }
-        }
-        None => Algorithm::English,
-    };
+    let stemmer_algo = crate::tokenizer::default::get_stemmer_algorithm(kwargs)?;
 
     let tokenizer = CompoundQueryTokenizer::new(stop_words_list, stemmer_algo);
     index.tokenizers().register(name, tokenizer);
     Ok(())
 }
 
+/// Query-side compound tokenizer.
+///
+/// A simpler pipeline than the index tokenizer — no WORD/COMPLEX classification
+/// or n-gram expansion. Instead it cleans query text to match what was indexed:
+///
+/// Pipeline: Whitespace split -> ASCII fold -> skip single-char punctuation ->
+///   strip leading/trailing punctuation (preserving wildcards) -> lowercase ->
+///   stop word removal -> stem (emitting both stemmed + original at same position)
 #[derive(Clone)]
 pub struct CompoundQueryTokenizer {
     stop_words: Vec<String>,
@@ -71,6 +65,11 @@ impl Tokenizer for CompoundQueryTokenizer {
     }
 }
 
+/// Token stream for the compound query tokenizer.
+///
+/// Like `CompoundIndexTokenStream`, buffers output tokens from each raw token.
+/// The buffer holds at most two tokens per raw input (stemmed form + original
+/// when they differ).
 pub struct CompoundQueryTokenStream<'a> {
     raw_tokens: Vec<&'a str>,
     raw_pos: usize,
@@ -105,10 +104,12 @@ impl<'a> CompoundQueryTokenStream<'a> {
             // Step 1: ASCII fold
             let folded = super::ascii_fold(raw);
 
-            // Step 2: Skip single-char punctuation (SkippingPunctuationStopFilter)
-            if folded.len() == 1 {
-                let c = folded.chars().next().unwrap();
-                if !c.is_alphanumeric() {
+            // Step 2: Skip single-char punctuation (SkippingPunctuationStopFilter).
+            // Use chars().count() not len() — len() counts bytes, which would miss
+            // multi-byte single characters like accented letters after ASCII folding.
+            let mut chars_iter = folded.chars();
+            if let Some(first_char) = chars_iter.next() {
+                if chars_iter.next().is_none() && !first_char.is_alphanumeric() {
                     continue;
                 }
             }
@@ -160,18 +161,8 @@ impl<'a> CompoundQueryTokenStream<'a> {
 
 impl<'a> TokenStream for CompoundQueryTokenStream<'a> {
     fn advance(&mut self) -> bool {
-        if self.buf_pos < self.buffer.len() {
-            let tok = &self.buffer[self.buf_pos];
-            self.token.text.clear();
-            self.token.text.push_str(&tok.text);
-            self.token.position = tok.position;
-            self.buf_pos += 1;
-            return true;
-        }
-        self.buffer.clear();
-        self.buf_pos = 0;
-
-        if self.process_next_raw_token() {
+        loop {
+            // Drain any buffered tokens first.
             if self.buf_pos < self.buffer.len() {
                 let tok = &self.buffer[self.buf_pos];
                 self.token.text.clear();
@@ -180,8 +171,14 @@ impl<'a> TokenStream for CompoundQueryTokenStream<'a> {
                 self.buf_pos += 1;
                 return true;
             }
+
+            // Buffer exhausted — try to fill it from the next raw token.
+            self.buffer.clear();
+            self.buf_pos = 0;
+            if !self.process_next_raw_token() {
+                return false;
+            }
         }
-        false
     }
 
     fn token(&self) -> &Token {

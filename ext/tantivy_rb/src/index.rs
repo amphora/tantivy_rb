@@ -1,8 +1,15 @@
+//! Index management for Tantivy, exposed to Ruby as `TantivyRb::Index`.
+//!
+//! Provides document indexing (add/delete/commit), reader management, search
+//! dispatch, and custom tokenizer registration. The writer is lazily created on
+//! first write so that read-only processes (e.g. the web server) never acquire
+//! the exclusive file lock.
+
 use crate::schema::RbSchema;
 use crate::search;
 use crate::tokenizer;
 use magnus::{class, function, method, prelude::*, r_hash::ForEach, Error, RHash, Symbol, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tantivy::schema::Schema;
 use tantivy::{DateTime, Index, IndexReader, IndexWriter, TantivyDocument};
 
@@ -12,12 +19,16 @@ use tantivy::{DateTime, Index, IndexReader, IndexWriter, TantivyDocument};
 /// for search does NOT acquire the exclusive file lock. This allows multiple
 /// read-only processes (e.g. web server serving searches) to coexist with a
 /// single writer process (e.g. rake task rebuilding the index).
+///
+/// The reader is stored without a Mutex because `IndexReader` is `Sync` —
+/// `searcher()` and `reload()` both take `&self` and are safe to call
+/// concurrently.
 #[magnus::wrap(class = "TantivyRb::Index")]
 pub struct RbIndex {
     index: Index,
     schema: Schema,
     writer: Arc<Mutex<Option<IndexWriter>>>,
-    reader: Arc<Mutex<IndexReader>>,
+    reader: IndexReader,
 }
 
 impl RbIndex {
@@ -68,13 +79,19 @@ impl RbIndex {
             index,
             schema,
             writer: Arc::new(Mutex::new(None)),
-            reader: Arc::new(Mutex::new(reader)),
+            reader,
         })
     }
 
-    /// Lazily create or return the IndexWriter. The exclusive file lock is
-    /// acquired here, on first write — NOT when the index is opened.
-    fn ensure_writer(&self) -> Result<(), Error> {
+    /// Lock the writer mutex and lazily create the IndexWriter if needed.
+    ///
+    /// Returns the held `MutexGuard` so the caller can use the writer without
+    /// releasing and re-acquiring the lock (which would create a TOCTOU gap
+    /// and require an unsafe unwrap on the second acquisition).
+    ///
+    /// The exclusive Tantivy file lock is acquired here on first write — NOT
+    /// when the index is opened.
+    fn lock_writer(&self) -> Result<MutexGuard<'_, Option<IndexWriter>>, Error> {
         let mut guard = self.writer.lock().map_err(|e| {
             Error::new(
                 magnus::exception::runtime_error(),
@@ -90,7 +107,7 @@ impl RbIndex {
             })?;
             *guard = Some(w);
         }
-        Ok(())
+        Ok(guard)
     }
 
     /// Add a document to the index. Takes a Ruby hash of field_name => value.
@@ -153,14 +170,9 @@ impl RbIndex {
             Ok(ForEach::Continue)
         })?;
 
-        self.ensure_writer()?;
-        let guard = self.writer.lock().map_err(|e| {
-            Error::new(
-                magnus::exception::runtime_error(),
-                format!("Failed to lock writer: {}", e),
-            )
-        })?;
-        guard.as_ref().unwrap().add_document(doc).map_err(|e| {
+        let guard = self.lock_writer()?;
+        let writer = guard.as_ref().expect("lock_writer guarantees Some");
+        writer.add_document(doc).map_err(|e| {
             Error::new(
                 magnus::exception::runtime_error(),
                 format!("Failed to add document: {}", e),
@@ -179,27 +191,17 @@ impl RbIndex {
         })?;
 
         let term = tantivy::Term::from_field_text(field, &value);
-        self.ensure_writer()?;
-        let guard = self.writer.lock().map_err(|e| {
-            Error::new(
-                magnus::exception::runtime_error(),
-                format!("Failed to lock writer: {}", e),
-            )
-        })?;
-        guard.as_ref().unwrap().delete_term(term);
+        let guard = self.lock_writer()?;
+        let writer = guard.as_ref().expect("lock_writer guarantees Some");
+        writer.delete_term(term);
         Ok(())
     }
 
     /// Commit pending changes to the index.
     fn commit(&self) -> Result<(), Error> {
-        self.ensure_writer()?;
-        let mut guard = self.writer.lock().map_err(|e| {
-            Error::new(
-                magnus::exception::runtime_error(),
-                format!("Failed to lock writer: {}", e),
-            )
-        })?;
-        guard.as_mut().unwrap().commit().map_err(|e| {
+        let mut guard = self.lock_writer()?;
+        let writer = guard.as_mut().expect("lock_writer guarantees Some");
+        writer.commit().map_err(|e| {
             Error::new(
                 magnus::exception::runtime_error(),
                 format!("Failed to commit: {}", e),
@@ -210,13 +212,7 @@ impl RbIndex {
 
     /// Reload the reader to pick up committed changes.
     fn reload(&self) -> Result<(), Error> {
-        let reader = self.reader.lock().map_err(|e| {
-            Error::new(
-                magnus::exception::runtime_error(),
-                format!("Failed to lock reader: {}", e),
-            )
-        })?;
-        reader.reload().map_err(|e| {
+        self.reader.reload().map_err(|e| {
             Error::new(
                 magnus::exception::runtime_error(),
                 format!("Failed to reload reader: {}", e),
@@ -235,19 +231,29 @@ impl RbIndex {
         tokenizer::register_tokenizer(&self.index, name, kwargs)
     }
 
+    /// Access the underlying Tantivy `Index` (for tokenizer registration and query parsing).
     pub fn index(&self) -> &Index {
         &self.index
     }
 
+    /// Access the built schema (for field lookup during document add and search).
     pub fn schema(&self) -> &Schema {
         &self.schema
     }
 
-    pub fn reader(&self) -> &Arc<Mutex<IndexReader>> {
+    /// Access the reader (for search). `IndexReader` is `Sync`, so `searcher()`
+    /// can be called concurrently from multiple threads without locking.
+    pub fn reader(&self) -> &IndexReader {
         &self.reader
     }
 }
 
+/// Parse a date string into a Tantivy `DateTime`.
+///
+/// Accepts three formats, tried in order:
+/// 1. RFC 3339 with timezone — `"2024-01-15T10:30:00+00:00"`
+/// 2. ISO 8601 without timezone (assumed UTC) — `"2024-01-15T10:30:00"`
+/// 3. Date only (midnight UTC) — `"2024-01-15"`
 fn parse_date(s: &str) -> Result<DateTime, Error> {
     let ts = chrono::DateTime::parse_from_rfc3339(s)
         .or_else(|_| {
@@ -257,7 +263,7 @@ fn parse_date(s: &str) -> Result<DateTime, Error> {
         .or_else(|_| {
             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|nd| {
                 nd.and_hms_opt(0, 0, 0)
-                    .unwrap()
+                    .expect("midnight (0,0,0) is always valid")
                     .and_utc()
                     .fixed_offset()
             })
@@ -273,6 +279,7 @@ fn parse_date(s: &str) -> Result<DateTime, Error> {
     Ok(DateTime::from_timestamp_secs(ts))
 }
 
+/// Register `TantivyRb::Index` and its methods on the given Ruby module.
 pub fn init(module: magnus::RModule) -> Result<(), Error> {
     let class = module.define_class("Index", class::object())?;
     class.define_singleton_method("open", function!(RbIndex::open, 2))?;

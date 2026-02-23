@@ -1,3 +1,9 @@
+//! Schema builder for Tantivy indexes, exposed to Ruby as `TantivyRb::Schema`.
+//!
+//! Wraps Tantivy's `SchemaBuilder` and provides Ruby methods to add typed fields.
+//! The schema is consumed (built) when passed to `TantivyRb::Index.open`, after
+//! which the builder cannot be reused.
+
 use magnus::{class, function, method, prelude::*, Error, RHash, Symbol, Value};
 use std::cell::RefCell;
 use tantivy::schema::{
@@ -6,6 +12,12 @@ use tantivy::schema::{
 };
 
 /// Wraps a Tantivy SchemaBuilder to construct a schema from Ruby.
+///
+/// Uses `RefCell<Option<>>` for interior mutability: the `Option` allows the
+/// builder to be consumed (taken) exactly once when `build()` is called.
+/// `RefCell` (not `Mutex`) is safe here because Ruby's GVL serialises all
+/// access from Ruby threads — Magnus-wrapped structs are never accessed
+/// concurrently.
 #[magnus::wrap(class = "TantivyRb::Schema")]
 pub struct RbSchema {
     inner: RefCell<Option<SchemaBuilder>>,
@@ -142,8 +154,12 @@ impl RbSchema {
     }
 }
 
-// Helper functions
+// ---------------------------------------------------------------------------
+// Helper functions for extracting typed values from Ruby keyword-argument hashes.
+// These handle the Symbol-keyed RHash that Ruby passes for `opts = {}` arguments.
+// ---------------------------------------------------------------------------
 
+/// Extract a boolean value from an RHash by symbol key, returning `None` if absent.
 fn hash_get_bool(hash: &RHash, key: &str) -> Result<Option<bool>, Error> {
     let sym = Symbol::new(key);
     match hash.get(sym) {
@@ -155,6 +171,7 @@ fn hash_get_bool(hash: &RHash, key: &str) -> Result<Option<bool>, Error> {
     }
 }
 
+/// Extract a string value from an RHash by symbol key, returning `None` if absent.
 fn hash_get_string(hash: &RHash, key: &str) -> Result<Option<String>, Error> {
     let sym = Symbol::new(key);
     match hash.get(sym) {
@@ -166,6 +183,10 @@ fn hash_get_string(hash: &RHash, key: &str) -> Result<Option<String>, Error> {
     }
 }
 
+/// Parse the common argument pattern for numeric/date field methods.
+///
+/// All numeric `add_*_field` methods accept `(name, opts = {})` where opts
+/// can contain `:stored`, `:indexed`, and `:fast`. Returns the parsed tuple.
 fn parse_numeric_args(args: &[Value], method_name: &str) -> Result<(String, bool, bool, bool), Error> {
     if args.is_empty() {
         return Err(Error::new(
@@ -193,6 +214,7 @@ fn parse_numeric_args(args: &[Value], method_name: &str) -> Result<(String, bool
     Ok((name, stored, indexed, fast))
 }
 
+/// Build a Tantivy `NumericOptions` from the parsed boolean flags.
 fn build_numeric_opts(stored: bool, indexed: bool, fast: bool) -> NumericOptions {
     let mut opts = NumericOptions::default();
     if stored {
@@ -207,6 +229,7 @@ fn build_numeric_opts(stored: bool, indexed: bool, fast: bool) -> NumericOptions
     opts
 }
 
+/// Register `TantivyRb::Schema` and its methods on the given Ruby module.
 pub fn init(module: magnus::RModule) -> Result<(), Error> {
     let class = module.define_class("Schema", class::object())?;
     class.define_singleton_method("new", function!(RbSchema::new, 0))?;

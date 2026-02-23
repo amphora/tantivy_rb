@@ -1,6 +1,19 @@
+//! Search execution for `TantivyRb::Index#search`.
+//!
+//! Supports two query modes:
+//!
+//! 1. **Default (no `query_tokenizer:`)** — delegates to Tantivy's built-in
+//!    `QueryParser`, which supports the standard Tantivy query syntax.
+//! 2. **Custom tokenizer (`query_tokenizer: "name"`)** — tokenizes the query
+//!    string through the named tokenizer and builds a custom AND-of-ORs query.
+//!    Same-position tokens (e.g. stemmed + original) are OR'd as synonyms;
+//!    different positions are AND'd. Supports quoted `"phrase"` searches.
+//!
+//! Both modes support optional field-level term filters via the `filter:` hash.
+
 use crate::index::RbIndex;
 use magnus::{prelude::*, r_hash::ForEach, Error, Ruby, RArray, RHash, RString, Symbol, Value};
-use tantivy::collector::{Count, TopDocs};
+use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, QueryParser, TermQuery};
 use tantivy::schema::{IndexRecordOption, OwnedValue};
 use tantivy::tokenizer::TokenStream;
@@ -13,6 +26,9 @@ use tantivy::TantivyDocument;
 ///
 /// Returns: { total: N, hits: [{ score: F, stored_fields: { ... } }, ...] }
 pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, Error> {
+    // SAFETY: This function is only ever called from Ruby via the magnus method!
+    // macro, which guarantees execution on a Ruby GVL thread after magnus::init
+    // has completed. Ruby::get_unchecked() requires exactly this invariant.
     let ruby = unsafe { Ruby::get_unchecked() };
 
     if ruby_args.is_empty() {
@@ -121,30 +137,23 @@ pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, 
         text_query
     };
 
-    let reader_guard = rb_index.reader().lock().map_err(|e| {
-        Error::new(
-            magnus::exception::runtime_error(),
-            format!("Failed to lock reader: {}", e),
-        )
-    })?;
-    let searcher = reader_guard.searcher();
+    let searcher = rb_index.reader().searcher();
 
+    // Use MultiCollector to gather TopDocs and Count in a single index scan.
     let fetch_count = limit + offset;
-    let top_docs = searcher
-        .search(&*final_query, &TopDocs::with_limit(fetch_count))
-        .map_err(|e| {
-            Error::new(
-                magnus::exception::runtime_error(),
-                format!("Search failed: {}", e),
-            )
-        })?;
+    let mut multi = MultiCollector::new();
+    let top_docs_handle = multi.add_collector(TopDocs::with_limit(fetch_count));
+    let count_handle = multi.add_collector(Count);
 
-    let total = searcher.search(&*final_query, &Count).map_err(|e| {
+    let mut multi_fruit = searcher.search(&*final_query, &multi).map_err(|e| {
         Error::new(
             magnus::exception::runtime_error(),
-            format!("Count failed: {}", e),
+            format!("Search failed: {}", e),
         )
     })?;
+
+    let top_docs = top_docs_handle.extract(&mut multi_fruit);
+    let total = count_handle.extract(&mut multi_fruit);
 
     let hits = RArray::new();
     for (score, doc_address) in top_docs.into_iter().skip(offset) {
@@ -271,7 +280,8 @@ fn build_tokenized_query(
     // Fast path: no quotes found — single Terms segment, use existing logic.
     if segments.len() == 1 {
         if let QuerySegment::Terms(ref text) = segments[0] {
-            return build_terms_query(rb_index, text, tokenizer_name, fields);
+            return Ok(build_terms_query(rb_index, text, tokenizer_name, fields)?
+                .unwrap_or_else(|| Box::new(tantivy::query::EmptyQuery)));
         }
     }
 
@@ -279,19 +289,16 @@ fn build_tokenized_query(
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
     for segment in &segments {
-        match segment {
+        let maybe_query = match segment {
             QuerySegment::Terms(text) => {
-                let q = build_terms_query(rb_index, text, tokenizer_name, fields)?;
-                if !is_empty_query(&q) {
-                    clauses.push((Occur::Must, q));
-                }
+                build_terms_query(rb_index, text, tokenizer_name, fields)?
             }
             QuerySegment::Phrase(text) => {
-                let q = build_phrase_query(rb_index, text, tokenizer_name, fields)?;
-                if !is_empty_query(&q) {
-                    clauses.push((Occur::Must, q));
-                }
+                build_phrase_query(rb_index, text, tokenizer_name, fields)?
             }
+        };
+        if let Some(q) = maybe_query {
+            clauses.push((Occur::Must, q));
         }
     }
 
@@ -305,22 +312,19 @@ fn build_tokenized_query(
     Ok(Box::new(BooleanQuery::new(clauses)))
 }
 
-/// Check if a query is an EmptyQuery by using its Debug representation.
-fn is_empty_query(q: &Box<dyn Query>) -> bool {
-    format!("{:?}", q) == "EmptyQuery"
-}
-
 /// Build a phrase query for a quoted segment.
 ///
 /// Tokenizes the phrase text, takes the first (stemmed) token at each position,
 /// and builds a PhraseQuery for each searchable field. The per-field phrase
 /// queries are OR'd together (the phrase could appear in any field).
+///
+/// Returns `None` if the tokenizer produces no tokens (e.g. all stop words).
 fn build_phrase_query(
     rb_index: &RbIndex,
     phrase_text: &str,
     tokenizer_name: &str,
     fields: &[tantivy::schema::Field],
-) -> Result<Box<dyn Query>, Error> {
+) -> Result<Option<Box<dyn Query>>, Error> {
     let tokenizer_manager = rb_index.index().tokenizers();
     let mut tokenizer = tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
         Error::new(
@@ -341,25 +345,26 @@ fn build_phrase_query(
     }
 
     if position_terms.is_empty() {
-        return Ok(Box::new(tantivy::query::EmptyQuery));
+        return Ok(None);
     }
 
     // Single token — fall back to a term query (phrase needs ≥2 terms).
     if position_terms.len() == 1 {
-        let token_text = position_terms.values().next().unwrap();
+        let token_text = position_terms.into_values().next()
+            .expect("len checked to be 1");
         let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for &field in fields {
-            let term = tantivy::Term::from_field_text(field, token_text);
+            let term = tantivy::Term::from_field_text(field, &token_text);
             field_clauses.push((
                 Occur::Should,
                 Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
             ));
         }
-        return Ok(Box::new(BooleanQuery::new(field_clauses)));
+        return Ok(Some(Box::new(BooleanQuery::new(field_clauses))));
     }
 
     // Build a PhraseQuery per field, OR'd together.
-    let ordered_texts: Vec<&String> = position_terms.values().collect();
+    let ordered_texts: Vec<String> = position_terms.into_values().collect();
     let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
     for &field in fields {
@@ -373,7 +378,7 @@ fn build_phrase_query(
         ));
     }
 
-    Ok(Box::new(BooleanQuery::new(field_clauses)))
+    Ok(Some(Box::new(BooleanQuery::new(field_clauses))))
 }
 
 /// Build the standard AND-of-ORs term query for unquoted text.
@@ -381,14 +386,16 @@ fn build_phrase_query(
 /// Tokens at the **same position** are treated as synonyms (OR'd together),
 /// matching how Lucene/Java handles same-position tokens from the analyzer.
 /// Tokens at **different positions** are AND'd together, so multi-word queries
-/// require all terms. Example: "running experiments" →
+/// require all terms. Example: "running experiments" ->
 ///   Must(run OR running across fields) AND Must(experi OR experiments across fields)
+///
+/// Returns `None` if the tokenizer produces no tokens (e.g. all stop words).
 fn build_terms_query(
     rb_index: &RbIndex,
     query_string: &str,
     tokenizer_name: &str,
     fields: &[tantivy::schema::Field],
-) -> Result<Box<dyn Query>, Error> {
+) -> Result<Option<Box<dyn Query>>, Error> {
     let tokenizer_manager = rb_index.index().tokenizers();
     let mut tokenizer = tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
         Error::new(
@@ -406,7 +413,7 @@ fn build_terms_query(
     }
 
     if positioned_tokens.is_empty() {
-        return Ok(Box::new(tantivy::query::EmptyQuery));
+        return Ok(None);
     }
 
     // Group tokens by position. Same-position tokens are synonyms (OR).
@@ -421,7 +428,7 @@ fn build_terms_query(
     // All synonyms at the same position are OR'd across all fields.
     // Different positions are AND'd together.
     let mut position_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-    for (_pos, synonyms) in &position_groups {
+    for synonyms in position_groups.values() {
         let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for token_text in synonyms {
             for &field in fields {
@@ -435,9 +442,19 @@ fn build_terms_query(
         position_clauses.push((Occur::Must, Box::new(BooleanQuery::new(field_clauses))));
     }
 
-    Ok(Box::new(BooleanQuery::new(position_clauses)))
+    Ok(Some(Box::new(BooleanQuery::new(position_clauses))))
 }
 
+/// Convert a Tantivy `OwnedValue` (from a stored field) into a Ruby `Value`.
+///
+/// Mapping:
+/// - `Str` → Ruby `String`
+/// - `U64` → Ruby `Integer` (cast to i64)
+/// - `I64` → Ruby `Integer`
+/// - `F64` → Ruby `Float`
+/// - `Date` → Ruby `Integer` (Unix timestamp in seconds)
+/// - `Bool` → Ruby `true`/`false`
+/// - Everything else → `nil`
 fn owned_value_to_ruby(val: &OwnedValue, ruby: &Ruby) -> Result<Value, Error> {
     Ok(match val {
         OwnedValue::Str(s) => RString::new(s).as_value(),

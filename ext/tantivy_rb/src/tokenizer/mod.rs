@@ -1,3 +1,14 @@
+//! Custom tokenizer registration for Tantivy indexes.
+//!
+//! Three tokenizer types are available:
+//!
+//! - `:default` — standard pipeline (whitespace, ASCII fold, lowercase, stop
+//!   words, stemmer). Good for general-purpose text.
+//! - `:raw` — no tokenization at all. Used for exact-match fields like IDs.
+//! - `:compound` — the PatentSafe-specific pipeline with WORD/COMPLEX
+//!   classification. Has two modes: `:index` (full expansion) and `:query`
+//!   (simplified for search input).
+
 pub mod compound;
 pub mod default;
 

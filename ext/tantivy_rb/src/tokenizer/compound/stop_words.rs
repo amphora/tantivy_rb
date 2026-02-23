@@ -1,9 +1,13 @@
-/// Stop word checking, ported from Java's SkippingStopFilter.
-///
-/// Only applies to WORD tokens (not COMPLEX). The stop word list matches
-/// Lucene 3.6's ENGLISH_STOP_WORDS_SET used by the Java application.
+//! Stop word checking, ported from Java's SkippingStopFilter.
+//!
+//! Only applies to WORD tokens (not COMPLEX). The stop word list matches
+//! Lucene 3.6's ENGLISH_STOP_WORDS_SET used by the Java application.
 
 /// Check if a lowercased token is a stop word.
+///
+/// Uses linear scan over the slice, which is fine for the default 33-word
+/// English list. If stop word lists grow significantly (hundreds of entries),
+/// consider switching to a `HashSet<String>` for O(1) lookups.
 pub fn is_stop_word(token: &str, stop_words: &[String]) -> bool {
     stop_words.iter().any(|sw| sw == token)
 }

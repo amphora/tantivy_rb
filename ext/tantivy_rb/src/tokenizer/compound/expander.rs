@@ -1,16 +1,17 @@
-/// N-gram expansion for COMPLEX tokens.
-///
-/// Ported from Java's ComplexTokenFilter. Breaks a complex token into character-type
-/// blocks (LETTER, NUMBER, OTHER) and generates sub-span combinations.
-///
-/// Example: "PROJ/ENG03:40" produces:
-///   Full token: "proj/eng03:40" (position 1)
-///   Sub-spans at position 0: "proj", "proj/", "proj/eng", "proj/eng03", "proj/eng03:",
-///     "/", "/eng", "/eng03", "/eng03:", "/eng03:40",
-///     "eng", "eng03", "eng03:", "eng03:40",
-///     "03", "03:", "03:40",
-///     ":", ":40",
-///     "40"
+//! N-gram expansion for COMPLEX tokens.
+//!
+//! Ported from Java's ComplexTokenFilter. Breaks a complex token into
+//! character-type blocks (LETTER, NUMBER, OTHER) and generates sub-span
+//! combinations. All sub-spans are emitted at the same position as the full
+//! token, so they act as synonyms in the index.
+//!
+//! Example: `"PROJ/ENG03:40"` produces:
+//!   - Full token: `"proj/eng03:40"`
+//!   - Sub-spans: `"proj"`, `"proj/"`, `"proj/eng"`, `"proj/eng03"`, ...,
+//!     `"eng"`, `"eng03"`, ..., `"03"`, `"03:40"`, `"40"`, etc.
+//!
+//! Bounded by `MAX_TOKEN_LENGTH` (100 chars) and `MAX_TOKEN_BLOCKS` (45 blocks)
+//! to prevent exponential expansion on pathological inputs like DNA sequences.
 
 /// Maximum length of a generated sub-token.
 const MAX_TOKEN_LENGTH: usize = 100;
@@ -36,10 +37,19 @@ impl CharType {
     }
 }
 
+/// A contiguous run of characters sharing the same `CharType`.
+///
+/// Used internally by the n-gram expander to split tokens into typed blocks
+/// before generating sub-span combinations.
 #[derive(Debug, Clone)]
 struct CharBlock {
+    /// Index into the `Vec<char>` where this block starts (inclusive).
+    /// Note: this is a char index, not a byte offset.
     start: usize,
+    /// Index into the `Vec<char>` where this block ends (exclusive).
+    /// Note: this is a char index, not a byte offset.
     end: usize,
+    /// The character type shared by all characters in this block.
     char_type: CharType,
 }
 

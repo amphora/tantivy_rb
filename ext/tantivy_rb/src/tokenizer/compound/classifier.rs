@@ -1,9 +1,9 @@
-/// Token classification, ported from Java's BlockTokenParsingFilter.
-///
-/// After stripping configurable leading/trailing punctuation, tokens are classified as:
-/// - WORD: entirely Unicode letters → gets stemmed + stop-word filtered
-/// - COMPLEX: mixed characters with at least one letter or digit → gets n-gram expanded
-/// - Skip: pure punctuation or empty → dropped
+//! Token classification, ported from Java's BlockTokenParsingFilter.
+//!
+//! After stripping configurable leading/trailing punctuation, tokens are classified as:
+//! - **WORD**: entirely Unicode letters — gets stemmed + stop-word filtered
+//! - **COMPLEX**: mixed characters with at least one letter or digit — gets n-gram expanded
+//! - **Skip**: pure punctuation or empty — dropped
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {

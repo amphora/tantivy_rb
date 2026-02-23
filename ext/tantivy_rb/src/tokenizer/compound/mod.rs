@@ -1,3 +1,16 @@
+//! Compound tokenizer — the core PatentSafe search tokenizer.
+//!
+//! Ported from the Java `FullIndexingAnalyser` and `PatentSafeQueryAnalyser`.
+//! This module provides two tokenizer variants:
+//!
+//! - **Index tokenizer** (`CompoundIndexTokenizer`) — full pipeline with
+//!   WORD/COMPLEX classification, n-gram expansion, stemming, and stop words.
+//! - **Query tokenizer** (`CompoundQueryTokenizer`, in the `query` submodule) —
+//!   simpler pipeline for search queries that cleans and stems input to match
+//!   indexed tokens.
+//!
+//! See `docs/TOKENIZERS.md` in the gem root for a detailed walkthrough.
+
 pub mod classifier;
 pub mod expander;
 pub mod query;
@@ -49,44 +62,15 @@ pub fn register(index: &Index, name: &str, kwargs: &RHash) -> Result<(), Error> 
     }
 }
 
+/// Build and register the compound index tokenizer from Ruby keyword arguments.
+///
+/// Reads `stemmer:`, `stop_words:`, `leading_strip:`, and `trailing_strip:`
+/// from the kwargs hash.
 fn register_index_tokenizer(index: &Index, name: &str, kwargs: &RHash) -> Result<(), Error> {
     let leading_strip = super::default::get_strip_chars(kwargs, "leading_strip")?;
     let trailing_strip = super::default::get_strip_chars(kwargs, "trailing_strip")?;
     let stop_words_list = super::default::get_stop_words(kwargs)?;
-
-    let stemmer_lang = match kwargs.get(Symbol::new("stemmer")) {
-        Some(val) => {
-            let sym: Symbol = magnus::TryConvert::try_convert(val)?;
-            let name = sym
-                .name()
-                .map_err(|e| Error::new(magnus::exception::runtime_error(), format!("{}", e)))?
-                .to_string();
-            match name.to_lowercase().as_str() {
-                "english" => Algorithm::English,
-                "french" => Algorithm::French,
-                "german" => Algorithm::German,
-                "spanish" => Algorithm::Spanish,
-                "italian" => Algorithm::Italian,
-                "portuguese" => Algorithm::Portuguese,
-                "dutch" => Algorithm::Dutch,
-                "swedish" => Algorithm::Swedish,
-                "norwegian" => Algorithm::Norwegian,
-                "danish" => Algorithm::Danish,
-                "finnish" => Algorithm::Finnish,
-                "hungarian" => Algorithm::Hungarian,
-                "romanian" => Algorithm::Romanian,
-                "russian" => Algorithm::Russian,
-                "turkish" => Algorithm::Turkish,
-                _ => {
-                    return Err(Error::new(
-                        magnus::exception::arg_error(),
-                        format!("Unknown stemmer language: {}", name),
-                    ))
-                }
-            }
-        }
-        None => Algorithm::English,
-    };
+    let stemmer_lang = super::default::get_stemmer_algorithm(kwargs)?;
 
     let tokenizer = CompoundIndexTokenizer::new(
         leading_strip,
@@ -145,6 +129,12 @@ impl Tokenizer for CompoundIndexTokenizer {
     }
 }
 
+/// Token stream for the compound index tokenizer.
+///
+/// Processes raw whitespace-split tokens one at a time, buffering the expanded
+/// output (a single raw token may produce many output tokens via n-gram
+/// expansion or stemmed+original dual-emission). The `advance()` method drains
+/// the buffer before processing the next raw token.
 pub struct CompoundIndexTokenStream<'a> {
     /// The whitespace-split tokens from the original text.
     raw_tokens: Vec<&'a str>,
@@ -265,20 +255,8 @@ impl<'a> CompoundIndexTokenStream<'a> {
 
 impl<'a> TokenStream for CompoundIndexTokenStream<'a> {
     fn advance(&mut self) -> bool {
-        // Return buffered tokens first
-        if self.buf_pos < self.buffer.len() {
-            let tok = &self.buffer[self.buf_pos];
-            self.token.text.clear();
-            self.token.text.push_str(&tok.text);
-            self.token.position = tok.position;
-            self.buf_pos += 1;
-            return true;
-        }
-        self.buffer.clear();
-        self.buf_pos = 0;
-
-        // Process next raw token
-        if self.process_next_raw_token() {
+        loop {
+            // Drain any buffered tokens first.
             if self.buf_pos < self.buffer.len() {
                 let tok = &self.buffer[self.buf_pos];
                 self.token.text.clear();
@@ -287,8 +265,14 @@ impl<'a> TokenStream for CompoundIndexTokenStream<'a> {
                 self.buf_pos += 1;
                 return true;
             }
+
+            // Buffer exhausted — try to fill it from the next raw token.
+            self.buffer.clear();
+            self.buf_pos = 0;
+            if !self.process_next_raw_token() {
+                return false;
+            }
         }
-        false
     }
 
     fn token(&self) -> &Token {
@@ -301,6 +285,10 @@ impl<'a> TokenStream for CompoundIndexTokenStream<'a> {
 }
 
 /// Basic ASCII folding: replace common accented characters with ASCII equivalents.
+///
+/// Covers the Latin-1 Supplement block (U+00C0–U+00FF) only. Characters outside
+/// this range pass through unchanged. This matches the subset of Java's
+/// ASCIIFoldingFilter that the PatentSafe data actually exercises.
 fn ascii_fold(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for c in s.chars() {
