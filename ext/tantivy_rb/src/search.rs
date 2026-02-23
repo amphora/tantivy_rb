@@ -1,7 +1,7 @@
 use crate::index::RbIndex;
 use magnus::{prelude::*, r_hash::ForEach, Error, Ruby, RArray, RHash, RString, Symbol, Value};
 use tantivy::collector::{Count, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, QueryParser, TermQuery};
 use tantivy::schema::{IndexRecordOption, OwnedValue};
 use tantivy::tokenizer::TokenStream;
 use tantivy::TantivyDocument;
@@ -195,20 +195,195 @@ pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, 
     Ok(result)
 }
 
-/// Build a query by tokenizing the query string with a named tokenizer,
-/// then constructing TermQuery objects for each token × field combination.
+/// A segment of a query string, either a quoted phrase or unquoted terms.
+#[derive(Debug, PartialEq)]
+enum QuerySegment {
+    /// Text between matched double-quotes — becomes a phrase query.
+    Phrase(String),
+    /// Unquoted text — becomes the standard AND-of-ORs term query.
+    Terms(String),
+}
+
+/// Parse a query string into segments of quoted phrases and unquoted terms.
 ///
-/// This allows using a different tokenizer at query time than at index time.
-/// The index tokenizer may expand tokens (e.g. n-gram sub-spans for COMPLEX tokens),
-/// while the query tokenizer produces only the canonical form, ensuring that
-/// searches match the full indexed token rather than noisy sub-spans.
+/// - Matched pairs of `"` delimit phrase segments.
+/// - Text outside quotes becomes term segments.
+/// - An unmatched trailing `"` is ignored (remainder treated as terms).
+/// - Empty phrases (`""`) are skipped.
+fn parse_query_segments(query: &str) -> Vec<QuerySegment> {
+    let mut segments = Vec::new();
+    let mut chars = query.char_indices().peekable();
+    let mut current_start = 0;
+    let mut in_phrase = false;
+
+    while let Some(&(i, c)) = chars.peek() {
+        if c == '"' {
+            if in_phrase {
+                // Closing quote — emit the phrase
+                let phrase_text = &query[current_start..i];
+                if !phrase_text.trim().is_empty() {
+                    segments.push(QuerySegment::Phrase(phrase_text.to_string()));
+                }
+                chars.next();
+                current_start = i + 1;
+                in_phrase = false;
+            } else {
+                // Opening quote — emit any preceding terms
+                let terms_text = &query[current_start..i];
+                if !terms_text.trim().is_empty() {
+                    segments.push(QuerySegment::Terms(terms_text.to_string()));
+                }
+                chars.next();
+                current_start = i + 1;
+                in_phrase = true;
+            }
+        } else {
+            chars.next();
+        }
+    }
+
+    // Handle remainder after last quote (or entire string if no quotes)
+    let remainder = &query[current_start..];
+    if !remainder.trim().is_empty() {
+        // Unmatched opening quote — treat remainder as terms, not a phrase
+        segments.push(QuerySegment::Terms(remainder.to_string()));
+    }
+
+    segments
+}
+
+/// Build a query by tokenizing the query string with a named tokenizer.
+///
+/// Supports quoted phrase search: `"exact phrase"` matches terms in order.
+/// Unquoted terms use the standard AND-of-ORs behaviour where all terms are
+/// required and same-position synonyms (stemmed + original) are OR'd.
+///
+/// Mixed queries work: `"phrase one" other terms "phrase two"` requires all
+/// three clauses (both phrases AND all loose terms).
+fn build_tokenized_query(
+    rb_index: &RbIndex,
+    query_string: &str,
+    tokenizer_name: &str,
+    fields: &[tantivy::schema::Field],
+) -> Result<Box<dyn Query>, Error> {
+    let segments = parse_query_segments(query_string);
+
+    // Fast path: no quotes found — single Terms segment, use existing logic.
+    if segments.len() == 1 {
+        if let QuerySegment::Terms(ref text) = segments[0] {
+            return build_terms_query(rb_index, text, tokenizer_name, fields);
+        }
+    }
+
+    // Build a clause for each segment and AND them together.
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+    for segment in &segments {
+        match segment {
+            QuerySegment::Terms(text) => {
+                let q = build_terms_query(rb_index, text, tokenizer_name, fields)?;
+                if !is_empty_query(&q) {
+                    clauses.push((Occur::Must, q));
+                }
+            }
+            QuerySegment::Phrase(text) => {
+                let q = build_phrase_query(rb_index, text, tokenizer_name, fields)?;
+                if !is_empty_query(&q) {
+                    clauses.push((Occur::Must, q));
+                }
+            }
+        }
+    }
+
+    if clauses.is_empty() {
+        return Ok(Box::new(tantivy::query::EmptyQuery));
+    }
+    if clauses.len() == 1 {
+        return Ok(clauses.remove(0).1);
+    }
+
+    Ok(Box::new(BooleanQuery::new(clauses)))
+}
+
+/// Check if a query is an EmptyQuery by using its Debug representation.
+fn is_empty_query(q: &Box<dyn Query>) -> bool {
+    format!("{:?}", q) == "EmptyQuery"
+}
+
+/// Build a phrase query for a quoted segment.
+///
+/// Tokenizes the phrase text, takes the first (stemmed) token at each position,
+/// and builds a PhraseQuery for each searchable field. The per-field phrase
+/// queries are OR'd together (the phrase could appear in any field).
+fn build_phrase_query(
+    rb_index: &RbIndex,
+    phrase_text: &str,
+    tokenizer_name: &str,
+    fields: &[tantivy::schema::Field],
+) -> Result<Box<dyn Query>, Error> {
+    let tokenizer_manager = rb_index.index().tokenizers();
+    let mut tokenizer = tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
+        Error::new(
+            magnus::exception::arg_error(),
+            format!("Unknown query tokenizer: '{}'", tokenizer_name),
+        )
+    })?;
+
+    // Collect tokens grouped by position. We only need the first token at each
+    // position (the stemmed form) for the phrase query.
+    let mut token_stream = tokenizer.token_stream(phrase_text);
+    let mut position_terms: std::collections::BTreeMap<usize, String> =
+        std::collections::BTreeMap::new();
+    while token_stream.advance() {
+        let tok = token_stream.token();
+        // Take only the first token at each position (stemmed form).
+        position_terms.entry(tok.position).or_insert_with(|| tok.text.clone());
+    }
+
+    if position_terms.is_empty() {
+        return Ok(Box::new(tantivy::query::EmptyQuery));
+    }
+
+    // Single token — fall back to a term query (phrase needs ≥2 terms).
+    if position_terms.len() == 1 {
+        let token_text = position_terms.values().next().unwrap();
+        let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for &field in fields {
+            let term = tantivy::Term::from_field_text(field, token_text);
+            field_clauses.push((
+                Occur::Should,
+                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+            ));
+        }
+        return Ok(Box::new(BooleanQuery::new(field_clauses)));
+    }
+
+    // Build a PhraseQuery per field, OR'd together.
+    let ordered_texts: Vec<&String> = position_terms.values().collect();
+    let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+    for &field in fields {
+        let terms: Vec<tantivy::Term> = ordered_texts
+            .iter()
+            .map(|text| tantivy::Term::from_field_text(field, text))
+            .collect();
+        field_clauses.push((
+            Occur::Should,
+            Box::new(PhraseQuery::new(terms)),
+        ));
+    }
+
+    Ok(Box::new(BooleanQuery::new(field_clauses)))
+}
+
+/// Build the standard AND-of-ORs term query for unquoted text.
 ///
 /// Tokens at the **same position** are treated as synonyms (OR'd together),
 /// matching how Lucene/Java handles same-position tokens from the analyzer.
 /// Tokens at **different positions** are AND'd together, so multi-word queries
 /// require all terms. Example: "running experiments" →
 ///   Must(run OR running across fields) AND Must(experi OR experiments across fields)
-fn build_tokenized_query(
+fn build_terms_query(
     rb_index: &RbIndex,
     query_string: &str,
     tokenizer_name: &str,
@@ -282,4 +457,86 @@ fn owned_value_to_ruby(val: &OwnedValue, ruby: &Ruby) -> Result<Value, Error> {
         }
         _ => ruby.qnil().as_value(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_no_quotes() {
+        let segments = parse_query_segments("hello world");
+        assert_eq!(segments, vec![QuerySegment::Terms("hello world".into())]);
+    }
+
+    #[test]
+    fn test_single_phrase() {
+        let segments = parse_query_segments("\"exact phrase\"");
+        assert_eq!(segments, vec![QuerySegment::Phrase("exact phrase".into())]);
+    }
+
+    #[test]
+    fn test_phrase_with_trailing_terms() {
+        let segments = parse_query_segments("\"exact phrase\" other terms");
+        assert_eq!(segments, vec![
+            QuerySegment::Phrase("exact phrase".into()),
+            QuerySegment::Terms(" other terms".into()),
+        ]);
+    }
+
+    #[test]
+    fn test_phrase_with_leading_terms() {
+        let segments = parse_query_segments("other terms \"exact phrase\"");
+        assert_eq!(segments, vec![
+            QuerySegment::Terms("other terms ".into()),
+            QuerySegment::Phrase("exact phrase".into()),
+        ]);
+    }
+
+    #[test]
+    fn test_mixed_phrases_and_terms() {
+        let segments = parse_query_segments("\"phrase one\" middle \"phrase two\"");
+        assert_eq!(segments, vec![
+            QuerySegment::Phrase("phrase one".into()),
+            QuerySegment::Terms(" middle ".into()),
+            QuerySegment::Phrase("phrase two".into()),
+        ]);
+    }
+
+    #[test]
+    fn test_unmatched_quote_treated_as_terms() {
+        let segments = parse_query_segments("\"unmatched quote");
+        assert_eq!(segments, vec![QuerySegment::Terms("unmatched quote".into())]);
+    }
+
+    #[test]
+    fn test_empty_quotes_skipped() {
+        let segments = parse_query_segments("\"\" hello");
+        assert_eq!(segments, vec![QuerySegment::Terms(" hello".into())]);
+    }
+
+    #[test]
+    fn test_only_empty_quotes() {
+        let segments = parse_query_segments("\"\"");
+        assert_eq!(segments, vec![] as Vec<QuerySegment>);
+    }
+
+    #[test]
+    fn test_multiple_phrases_no_terms() {
+        let segments = parse_query_segments("\"first phrase\" \"second phrase\"");
+        assert_eq!(segments, vec![
+            QuerySegment::Phrase("first phrase".into()),
+            QuerySegment::Phrase("second phrase".into()),
+        ]);
+    }
+
+    #[test]
+    fn test_real_world_query() {
+        let segments = parse_query_segments(
+            "\"Cryptographic Controls and Key Management Policy\""
+        );
+        assert_eq!(segments, vec![
+            QuerySegment::Phrase("Cryptographic Controls and Key Management Policy".into()),
+        ]);
+    }
 }
