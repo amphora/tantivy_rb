@@ -1,0 +1,15 @@
+[package]
+name = "tantivy_rb"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = { version = "0.7", features = ["rb-sys"] }
+rb-sys = "0.9"
+tantivy = "0.22"
+rust-stemmers = "1.2"
+chrono = "0.4"

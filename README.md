@@ -1,1 +1,0 @@
-# tantivy_rb

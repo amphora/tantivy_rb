@@ -1,0 +1,10 @@
+/target/
+/tmp/
+ext/tantivy_rb/target/
+ext/tantivy_rb/.sitearchdir.time
+ext/tantivy_rb/tantivy_rb.so
+ext/tantivy_rb/Makefile
+lib/tantivy_rb/tantivy_rb.so
+*.o
+*.bundle
+*.dylib
