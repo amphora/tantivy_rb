@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["ext/tantivy_rb"]
+
+[workspace.metadata]
+description = "tantivy_rb — Ruby bindings for the Tantivy search engine"
+repository = "https://github.com/amphora/tantivy_rb"

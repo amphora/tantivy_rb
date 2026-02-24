@@ -3,13 +3,20 @@ name = "tantivy_rb"
 version = "0.1.0"
 edition = "2021"
 publish = false
+description = "Ruby native extension wrapping the Tantivy full-text search engine via magnus/rb-sys"
+authors = ["Amphora Research Systems <dev@amphora.net>"]
+license = "Proprietary"
+readme = "../../README.md"
+rust-version = "1.75"
 
 [lib]
 crate-type = ["cdylib"]
 
+# magnus 0.7 requires Ruby >= 3.0; rb-sys must track the same minor series.
+# tantivy processes user-controlled content — pin to audited versions.
 [dependencies]
-magnus = { version = "0.7", features = ["rb-sys"] }
-rb-sys = "0.9"
-tantivy = "0.22"
-rust-stemmers = "1.2"
-chrono = "0.4"
+magnus = { version = "=0.7.1", features = ["rb-sys"] }
+rb-sys = "=0.9.124"
+tantivy = "=0.22.1"
+rust-stemmers = "=1.2.0"
+chrono = "=0.4.43"  # >= 0.4.20 required to avoid RUSTSEC-2020-0159
