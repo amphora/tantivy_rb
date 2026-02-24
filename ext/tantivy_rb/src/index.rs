@@ -294,3 +294,8 @@ pub fn init(module: magnus::RModule) -> Result<(), Error> {
     )?;
     Ok(())
 }
+
+// TODO:: [DEFERRED] Add #[cfg(test)] module with unit tests
+// Targets: parse_date (pure fn, branching logic), lock_writer behaviour,
+// add_document field-type dispatch, lazy writer initialisation
+// See: AMPHTT-731

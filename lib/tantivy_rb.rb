@@ -13,6 +13,8 @@ require_relative "tantivy_rb/version"
 # Load the compiled Rust native extension. rb_sys places the .so under a
 # Ruby-version-specific directory (e.g. tantivy_rb/3.3/tantivy_rb.so);
 # fall back to the unversioned path for development builds.
+# TODO:: [DEFERRED] Add unit test for load fallback logic (stub require to simulate LoadError)
+# See: AMPHTT-732
 begin
   ruby_api_version = RUBY_VERSION[/\d+\.\d+/]
   require "tantivy_rb/#{ruby_api_version}/tantivy_rb"

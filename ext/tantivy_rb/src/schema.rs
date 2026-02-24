@@ -240,3 +240,7 @@ pub fn init(module: magnus::RModule) -> Result<(), Error> {
     class.define_method("add_date_field", method!(RbSchema::add_date_field, -1))?;
     Ok(())
 }
+
+// TODO:: [DEFERRED] Add #[cfg(test)] module with unit tests
+// Targets: double-build guard ("Schema already built"), hash option parsing
+// See: AMPHTT-731
