@@ -29,86 +29,68 @@ pub fn register(index: &Index, name: &str, kwargs: &RHash) -> Result<(), Error> 
     Ok(())
 }
 
-/// Parse the `stemmer:` option. Defaults to English.
-pub fn get_stemmer_lang(kwargs: &RHash) -> Result<Language, Error> {
-    let lang = match kwargs.get(Symbol::new("stemmer")) {
+/// Supported stemmer languages: `:english`, `:french`, `:german`, `:spanish`,
+/// `:italian`, `:portuguese`, `:dutch`, `:swedish`, `:norwegian`, `:danish`,
+/// `:finnish`, `:hungarian`, `:romanian`, `:russian`, `:turkish`, `:arabic`.
+///
+/// Single lookup table maps language name → (tantivy Language, rust_stemmers Algorithm).
+/// Used by both `get_stemmer_lang` and `get_stemmer_algorithm` to keep language
+/// support in sync without duplication.
+const LANGUAGE_TABLE: &[(&str, Language, Algorithm)] = &[
+    ("english", Language::English, Algorithm::English),
+    ("french", Language::French, Algorithm::French),
+    ("german", Language::German, Algorithm::German),
+    ("spanish", Language::Spanish, Algorithm::Spanish),
+    ("italian", Language::Italian, Algorithm::Italian),
+    ("portuguese", Language::Portuguese, Algorithm::Portuguese),
+    ("dutch", Language::Dutch, Algorithm::Dutch),
+    ("swedish", Language::Swedish, Algorithm::Swedish),
+    ("norwegian", Language::Norwegian, Algorithm::Norwegian),
+    ("danish", Language::Danish, Algorithm::Danish),
+    ("finnish", Language::Finnish, Algorithm::Finnish),
+    ("hungarian", Language::Hungarian, Algorithm::Hungarian),
+    ("romanian", Language::Romanian, Algorithm::Romanian),
+    ("russian", Language::Russian, Algorithm::Russian),
+    ("turkish", Language::Turkish, Algorithm::Turkish),
+    ("arabic", Language::Arabic, Algorithm::Arabic),
+];
+
+/// Parse a Ruby `:stemmer` symbol into a `(Language, Algorithm)` pair.
+/// Returns English defaults if no `:stemmer` key is present.
+fn parse_stemmer_option(kwargs: &RHash) -> Result<(Language, Algorithm), Error> {
+    match kwargs.get(Symbol::new("stemmer")) {
         Some(val) => {
             let sym: Symbol = magnus::TryConvert::try_convert(val)?;
             let name = sym.name().map_err(|e| {
                 Error::new(magnus::exception::runtime_error(), format!("{}", e))
             })?.to_string();
-            match name.to_lowercase().as_str() {
-                "english" => Language::English,
-                "french" => Language::French,
-                "german" => Language::German,
-                "spanish" => Language::Spanish,
-                "italian" => Language::Italian,
-                "portuguese" => Language::Portuguese,
-                "dutch" => Language::Dutch,
-                "swedish" => Language::Swedish,
-                "norwegian" => Language::Norwegian,
-                "danish" => Language::Danish,
-                "finnish" => Language::Finnish,
-                "hungarian" => Language::Hungarian,
-                "romanian" => Language::Romanian,
-                "russian" => Language::Russian,
-                "turkish" => Language::Turkish,
-                "arabic" => Language::Arabic,
-                _ => {
-                    return Err(Error::new(
+            let lower = name.to_lowercase();
+            LANGUAGE_TABLE
+                .iter()
+                .find(|(n, _, _)| *n == lower)
+                .map(|(_, lang, algo)| (*lang, *algo))
+                .ok_or_else(|| {
+                    Error::new(
                         magnus::exception::arg_error(),
                         format!("Unknown stemmer language: {}", name),
-                    ))
-                }
-            }
+                    )
+                })
         }
-        None => Language::English,
-    };
-    Ok(lang)
+        None => Ok((Language::English, Algorithm::English)),
+    }
+}
+
+/// Parse the `stemmer:` option into a tantivy `Language`. Defaults to English.
+pub fn get_stemmer_lang(kwargs: &RHash) -> Result<Language, Error> {
+    parse_stemmer_option(kwargs).map(|(lang, _)| lang)
 }
 
 /// Parse the `stemmer:` option into a `rust_stemmers::Algorithm`. Defaults to English.
 ///
 /// Shared by the compound index and query tokenizers which use `rust_stemmers`
 /// directly (unlike the default tokenizer which uses Tantivy's built-in `Stemmer`).
-///
-/// Supported languages: `:english`, `:french`, `:german`, `:spanish`, `:italian`,
-/// `:portuguese`, `:dutch`, `:swedish`, `:norwegian`, `:danish`, `:finnish`,
-/// `:hungarian`, `:romanian`, `:russian`, `:turkish`.
 pub fn get_stemmer_algorithm(kwargs: &RHash) -> Result<Algorithm, Error> {
-    let algo = match kwargs.get(Symbol::new("stemmer")) {
-        Some(val) => {
-            let sym: Symbol = magnus::TryConvert::try_convert(val)?;
-            let name = sym.name().map_err(|e| {
-                Error::new(magnus::exception::runtime_error(), format!("{}", e))
-            })?.to_string();
-            match name.to_lowercase().as_str() {
-                "english" => Algorithm::English,
-                "french" => Algorithm::French,
-                "german" => Algorithm::German,
-                "spanish" => Algorithm::Spanish,
-                "italian" => Algorithm::Italian,
-                "portuguese" => Algorithm::Portuguese,
-                "dutch" => Algorithm::Dutch,
-                "swedish" => Algorithm::Swedish,
-                "norwegian" => Algorithm::Norwegian,
-                "danish" => Algorithm::Danish,
-                "finnish" => Algorithm::Finnish,
-                "hungarian" => Algorithm::Hungarian,
-                "romanian" => Algorithm::Romanian,
-                "russian" => Algorithm::Russian,
-                "turkish" => Algorithm::Turkish,
-                _ => {
-                    return Err(Error::new(
-                        magnus::exception::arg_error(),
-                        format!("Unknown stemmer language: {}", name),
-                    ))
-                }
-            }
-        }
-        None => Algorithm::English,
-    };
-    Ok(algo)
+    parse_stemmer_option(kwargs).map(|(_, algo)| algo)
 }
 
 /// Parse the `stop_words:` option. Accepts a language symbol or array of strings.

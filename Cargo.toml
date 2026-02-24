@@ -5,3 +5,10 @@ members = ["ext/tantivy_rb"]
 [workspace.metadata]
 description = "tantivy_rb — Ruby bindings for the Tantivy search engine"
 repository = "https://github.com/amphora/tantivy_rb"
+
+# Optimise the cdylib for size and speed. LTO + single codegen unit
+# produces a smaller, faster .so at the cost of longer compile times.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

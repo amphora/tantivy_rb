@@ -25,6 +25,9 @@ use tantivy::TantivyDocument;
 ///   index.search(query_string, fields: [...], filter: {}, limit: 20, offset: 0)
 ///
 /// Returns: { total: N, hits: [{ score: F, stored_fields: { ... } }, ...] }
+// TODO:: [DEFERRED] Decompose into parse_search_args, execute_query, marshal_results
+// Reason: ~177 lines mixing argument parsing, query construction, collection, and marshalling
+// See: AMPHTT-730
 pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, Error> {
     // SAFETY: This function is only ever called from Ruby via the magnus method!
     // macro, which guarantees execution on a Ruby GVL thread after magnus::init
@@ -124,6 +127,16 @@ pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, 
                     format!("Unknown filter field: {}", field_name),
                 )
             })?;
+            let field_entry = schema.get_field_entry(field);
+            if !matches!(field_entry.field_type(), tantivy::schema::FieldType::Str(_)) {
+                return Err(Error::new(
+                    magnus::exception::arg_error(),
+                    format!(
+                        "Filter field '{}' is not a text field. Only text fields are supported in filter:",
+                        field_name
+                    ),
+                ));
+            }
             let term = tantivy::Term::from_field_text(field, &field_value);
             clauses.push((
                 Occur::Must,
@@ -458,7 +471,12 @@ fn build_terms_query(
 fn owned_value_to_ruby(val: &OwnedValue, ruby: &Ruby) -> Result<Value, Error> {
     Ok(match val {
         OwnedValue::Str(s) => RString::new(s).as_value(),
-        OwnedValue::U64(n) => ruby.integer_from_i64(*n as i64).as_value(),
+        OwnedValue::U64(n) => {
+            match i64::try_from(*n) {
+                Ok(i) => ruby.integer_from_i64(i).as_value(),
+                Err(_) => RString::new(&n.to_string()).as_value(),
+            }
+        }
         OwnedValue::I64(n) => ruby.integer_from_i64(*n).as_value(),
         OwnedValue::F64(n) => ruby.float_from_f64(*n).as_value(),
         OwnedValue::Date(dt) => {
@@ -556,4 +574,8 @@ mod tests {
             QuerySegment::Phrase("Cryptographic Controls and Key Management Policy".into()),
         ]);
     }
+
+    // TODO:: [DEFERRED] Add unit tests for build_terms_query, build_phrase_query,
+    // owned_value_to_ruby (pure fn, multiple branches), and filter-clause construction
+    // See: AMPHTT-731
 }
