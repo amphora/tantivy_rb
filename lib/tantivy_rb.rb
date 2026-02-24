@@ -5,7 +5,7 @@
 #   TantivyRb::Index  — open/create an index, add/delete/search documents
 #
 # The native extension is a Rust cdylib built via rb_sys and magnus.
-# See the gem README for usage examples and the docs/ directory for
+# See README.md for usage examples and docs/TOKENIZERS.md for
 # detailed tokenizer documentation.
 
 require_relative "tantivy_rb/version"
@@ -17,5 +17,13 @@ begin
   ruby_api_version = RUBY_VERSION[/\d+\.\d+/]
   require "tantivy_rb/#{ruby_api_version}/tantivy_rb"
 rescue LoadError
-  require "tantivy_rb/tantivy_rb"
+  begin
+    require "tantivy_rb/tantivy_rb"
+  rescue LoadError => e
+    raise LoadError,
+      "Failed to load tantivy_rb native extension. " \
+      "Tried #{ruby_api_version}/ and unversioned paths. " \
+      "Run `cd ext/tantivy_rb && cargo build --release` to compile. " \
+      "Original error: #{e.message}"
+  end
 end
