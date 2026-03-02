@@ -29,6 +29,7 @@ pub struct RbIndex {
     schema: Schema,
     writer: Arc<Mutex<Option<IndexWriter>>>,
     reader: IndexReader,
+    read_only: bool,
 }
 
 impl RbIndex {
@@ -80,6 +81,52 @@ impl RbIndex {
             schema,
             writer: Arc::new(Mutex::new(None)),
             reader,
+            read_only: false,
+        })
+    }
+
+    /// Open an existing index at the given path in read-only mode.
+    ///
+    /// Uses `Index::open_in_dir` which reads the schema from `meta.json`
+    /// and never touches the write lock file. This allows read-only
+    /// processes (console, runner, rake tasks) to coexist with a running
+    /// writer process without lock contention.
+    ///
+    /// The index directory must already exist (no auto-creation).
+    /// Write operations (`add_document`, `delete_document`, `commit`) will
+    /// return an error.
+    fn open_readonly(path: String) -> Result<Self, Error> {
+        let dir = std::path::Path::new(&path);
+
+        let directory = tantivy::directory::MmapDirectory::open(dir).map_err(|e| {
+            Error::new(
+                magnus::exception::runtime_error(),
+                format!("Failed to open directory: {}", e),
+            )
+        })?;
+
+        let index = Index::open(directory).map_err(|e| {
+            Error::new(
+                magnus::exception::runtime_error(),
+                format!("Failed to open index (does it exist?): {}", e),
+            )
+        })?;
+
+        let schema = index.schema();
+
+        let reader = index.reader().map_err(|e| {
+            Error::new(
+                magnus::exception::runtime_error(),
+                format!("Failed to create reader: {}", e),
+            )
+        })?;
+
+        Ok(RbIndex {
+            index,
+            schema,
+            writer: Arc::new(Mutex::new(None)),
+            reader,
+            read_only: true,
         })
     }
 
@@ -92,6 +139,12 @@ impl RbIndex {
     /// The exclusive Tantivy file lock is acquired here on first write — NOT
     /// when the index is opened.
     fn lock_writer(&self) -> Result<MutexGuard<'_, Option<IndexWriter>>, Error> {
+        if self.read_only {
+            return Err(Error::new(
+                magnus::exception::runtime_error(),
+                "Cannot write to a read-only index",
+            ));
+        }
         let mut guard = self.writer.lock().map_err(|e| {
             Error::new(
                 magnus::exception::runtime_error(),
@@ -283,6 +336,7 @@ fn parse_date(s: &str) -> Result<DateTime, Error> {
 pub fn init(module: magnus::RModule) -> Result<(), Error> {
     let class = module.define_class("Index", class::object())?;
     class.define_singleton_method("open", function!(RbIndex::open, 2))?;
+    class.define_singleton_method("open_readonly", function!(RbIndex::open_readonly, 1))?;
     class.define_method("add_document", method!(RbIndex::add_document, 1))?;
     class.define_method("delete_document", method!(RbIndex::delete_document, 2))?;
     class.define_method("commit", method!(RbIndex::commit, 0))?;
