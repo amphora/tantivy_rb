@@ -279,6 +279,24 @@ impl RbIndex {
         search::execute_search(self, ruby_args)
     }
 
+    /// Release the index writer, dropping the exclusive file lock.
+    ///
+    /// After calling this, further write operations will lazily create a new
+    /// writer (and re-acquire the lock). This is used by `SearchService.reset_default!`
+    /// to ensure the old singleton's file lock is released before the reference
+    /// is dropped, avoiding `LockBusy` errors when a new singleton is created
+    /// before GC collects the old one.
+    fn release_writer(&self) -> Result<(), Error> {
+        let mut guard = self.writer.lock().map_err(|e| {
+            Error::new(
+                magnus::exception::runtime_error(),
+                format!("Failed to lock writer mutex: {}", e),
+            )
+        })?;
+        *guard = None;
+        Ok(())
+    }
+
     /// Register a custom tokenizer on this index.
     fn register_tokenizer(&self, name: String, kwargs: RHash) -> Result<(), Error> {
         tokenizer::register_tokenizer(&self.index, name, kwargs)
@@ -342,6 +360,7 @@ pub fn init(module: magnus::RModule) -> Result<(), Error> {
     class.define_method("commit", method!(RbIndex::commit, 0))?;
     class.define_method("reload", method!(RbIndex::reload, 0))?;
     class.define_method("search", method!(RbIndex::search, -1))?;
+    class.define_method("release_writer", method!(RbIndex::release_writer, 0))?;
     class.define_method(
         "register_tokenizer",
         method!(RbIndex::register_tokenizer, 2),
