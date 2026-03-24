@@ -255,7 +255,19 @@ impl RbIndex {
 /// 2. ISO 8601 without timezone (assumed UTC) — `"2024-01-15T10:30:00"`
 /// 3. Date only (midnight UTC) — `"2024-01-15"`
 fn parse_date(s: &str) -> Result<DateTime, Error> {
-    let ts = chrono::DateTime::parse_from_rfc3339(s)
+    let ts = parse_date_to_timestamp(s).map_err(|msg| {
+        Error::new(magnus::exception::arg_error(), msg)
+    })?;
+    Ok(DateTime::from_timestamp_secs(ts))
+}
+
+/// Pure date parsing logic, free of Magnus dependencies.
+///
+/// Returns a Unix timestamp (seconds since epoch) or an error message string.
+/// Extracted from `parse_date` so that `#[cfg(test)]` code can exercise the
+/// parsing branches without pulling Ruby symbols into the test binary.
+fn parse_date_to_timestamp(s: &str) -> Result<i64, String> {
+    chrono::DateTime::parse_from_rfc3339(s)
         .or_else(|_| {
             chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
                 .map(|ndt| ndt.and_utc().fixed_offset())
@@ -268,15 +280,8 @@ fn parse_date(s: &str) -> Result<DateTime, Error> {
                     .fixed_offset()
             })
         })
-        .map_err(|e| {
-            Error::new(
-                magnus::exception::arg_error(),
-                format!("Failed to parse date '{}': {}", s, e),
-            )
-        })?
-        .timestamp();
-
-    Ok(DateTime::from_timestamp_secs(ts))
+        .map(|dt| dt.timestamp())
+        .map_err(|e| format!("Failed to parse date '{}': {}", s, e))
 }
 
 /// Register `TantivyRb::Index` and its methods on the given Ruby module.
@@ -295,7 +300,40 @@ pub fn init(module: magnus::RModule) -> Result<(), Error> {
     Ok(())
 }
 
-// TODO:: [DEFERRED] Add #[cfg(test)] module with unit tests
-// Targets: parse_date (pure fn, branching logic), lock_writer behaviour,
-// add_document field-type dispatch, lazy writer initialisation
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_date_rfc3339() {
+        let ts = parse_date_to_timestamp("2024-01-15T10:30:00+00:00").unwrap();
+        assert_eq!(ts, 1705314600); // 2024-01-15 10:30:00 UTC
+    }
+
+    #[test]
+    fn test_parse_date_iso8601_no_tz() {
+        let ts = parse_date_to_timestamp("2024-01-15T10:30:00").unwrap();
+        assert_eq!(ts, 1705314600); // No TZ → assumed UTC
+    }
+
+    #[test]
+    fn test_parse_date_date_only() {
+        let ts = parse_date_to_timestamp("2024-01-15").unwrap();
+        assert_eq!(ts, 1705276800); // Midnight UTC on 2024-01-15
+    }
+
+    #[test]
+    fn test_parse_date_invalid() {
+        let result = parse_date_to_timestamp("not-a-date");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to parse date"));
+    }
+}
+
+// TODO:: [DEFERRED] Add Ruby-dependent unit tests (requires magnus::embed or Ruby linking)
+// Targets: lock_writer lazy init / read-only rejection, add_document field-type dispatch
+// Reason: Constructing RbIndex triggers #[magnus::wrap] trait code that references Ruby
+// symbols, causing linker errors in pure-Rust test binaries. Needs either embed feature
+// flag or a refactor to decouple testable logic from the Magnus wrapper.
+// Scope: 3
 // See: AMPHTT-731
