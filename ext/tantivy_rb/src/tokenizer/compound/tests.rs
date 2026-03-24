@@ -482,6 +482,84 @@ CGAATTCGCCCTTTAATACGACTCACTATAGGGCCAGGCAGCGAGTGT-C--CTACCC---AGCTAGTTGTGGTGCCTGT
     }
 }
 
+// =========================================================================
+// Unit tests for ascii_fold (compound/mod.rs)
+// =========================================================================
+
+#[cfg(test)]
+mod ascii_fold_tests {
+    use super::super::ascii_fold;
+
+    #[test]
+    fn test_uppercase_accented_vowels() {
+        // À-Å → A
+        assert_eq!(ascii_fold("\u{00C0}\u{00C1}\u{00C2}\u{00C3}\u{00C4}\u{00C5}"), "AAAAAA");
+        // È-Ë → E
+        assert_eq!(ascii_fold("\u{00C8}\u{00C9}\u{00CA}\u{00CB}"), "EEEE");
+        // Ì-Ï → I
+        assert_eq!(ascii_fold("\u{00CC}\u{00CD}\u{00CE}\u{00CF}"), "IIII");
+        // Ò-Ö → O, Ø → O
+        assert_eq!(ascii_fold("\u{00D2}\u{00D3}\u{00D4}\u{00D5}\u{00D6}\u{00D8}"), "OOOOOO");
+        // Ù-Ü → U
+        assert_eq!(ascii_fold("\u{00D9}\u{00DA}\u{00DB}\u{00DC}"), "UUUU");
+    }
+
+    #[test]
+    fn test_lowercase_accented_vowels() {
+        // à-å → a
+        assert_eq!(ascii_fold("\u{00E0}\u{00E1}\u{00E2}\u{00E3}\u{00E4}\u{00E5}"), "aaaaaa");
+        // è-ë → e
+        assert_eq!(ascii_fold("\u{00E8}\u{00E9}\u{00EA}\u{00EB}"), "eeee");
+        // ì-ï → i
+        assert_eq!(ascii_fold("\u{00EC}\u{00ED}\u{00EE}\u{00EF}"), "iiii");
+        // ò-ö → o, ø → o
+        assert_eq!(ascii_fold("\u{00F2}\u{00F3}\u{00F4}\u{00F5}\u{00F6}\u{00F8}"), "oooooo");
+        // ù-ü → u
+        assert_eq!(ascii_fold("\u{00F9}\u{00FA}\u{00FB}\u{00FC}"), "uuuu");
+    }
+
+    #[test]
+    fn test_ligatures_and_special() {
+        assert_eq!(ascii_fold("\u{00C6}"), "AE"); // Æ
+        assert_eq!(ascii_fold("\u{00E6}"), "ae"); // æ
+        assert_eq!(ascii_fold("\u{00C7}"), "C");  // Ç
+        assert_eq!(ascii_fold("\u{00E7}"), "c");  // ç
+        assert_eq!(ascii_fold("\u{00D1}"), "N");  // Ñ
+        assert_eq!(ascii_fold("\u{00F1}"), "n");  // ñ
+        assert_eq!(ascii_fold("\u{00D0}"), "D");  // Ð
+        assert_eq!(ascii_fold("\u{00F0}"), "d");  // ð
+        assert_eq!(ascii_fold("\u{00DD}"), "Y");  // Ý
+        assert_eq!(ascii_fold("\u{00FD}"), "y");  // ý
+        assert_eq!(ascii_fold("\u{00FF}"), "y");  // ÿ
+    }
+
+    #[test]
+    fn test_plain_ascii_passthrough() {
+        assert_eq!(ascii_fold("Hello World 123!"), "Hello World 123!");
+        assert_eq!(ascii_fold("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"),
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
+    }
+
+    #[test]
+    fn test_non_latin1_passthrough() {
+        // Chinese characters, emoji — outside U+00C0–U+00FF, should pass through
+        assert_eq!(ascii_fold("\u{4e16}\u{754c}"), "\u{4e16}\u{754c}"); // 世界
+        assert_eq!(ascii_fold("\u{1F600}"), "\u{1F600}"); // 😀
+    }
+
+    #[test]
+    fn test_mixed_string() {
+        assert_eq!(ascii_fold("caf\u{00E9}"), "cafe");
+        assert_eq!(ascii_fold("\u{00DC}nters\u{00FC}chung"), "Untersuchung");
+        assert_eq!(ascii_fold("na\u{00EF}ve"), "naive");
+    }
+
+    #[test]
+    fn test_empty_string() {
+        assert_eq!(ascii_fold(""), "");
+    }
+}
+
 #[cfg(test)]
 mod query_tokenizer_tests {
     use crate::tokenizer::compound::query::CompoundQueryTokenizer;

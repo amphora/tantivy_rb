@@ -3,7 +3,7 @@ require_relative "lib/tantivy_rb/version"
 Gem::Specification.new do |spec|
   spec.name = "tantivy_rb"
   spec.version = TantivyRb::VERSION
-  spec.authors = ["Amphora Research Systems"]
+  spec.authors = [ "Amphora Research Systems" ]
   spec.license = "MIT"
 
   spec.summary = "Ruby bindings for the Tantivy full-text search engine"
@@ -21,8 +21,8 @@ Gem::Specification.new do |spec|
     "README.md"
   ]
 
-  spec.require_paths = ["lib"]
-  spec.extensions = ["ext/tantivy_rb/extconf.rb"]
+  spec.require_paths = [ "lib" ]
+  spec.extensions = [ "ext/tantivy_rb/extconf.rb" ]
 
   spec.add_dependency "rb_sys", "~> 0.9"
 end
