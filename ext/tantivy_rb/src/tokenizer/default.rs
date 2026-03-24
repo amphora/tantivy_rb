@@ -137,6 +137,38 @@ pub fn english_stop_words() -> Vec<String> {
     .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_english_stop_words_count() {
+        let words = english_stop_words();
+        assert_eq!(words.len(), 33, "Expected 33 English stop words, got {}", words.len());
+    }
+
+    #[test]
+    fn test_english_stop_words_known_entries() {
+        let words = english_stop_words();
+        for expected in &["a", "the", "and", "is", "with", "not", "or", "for", "to"] {
+            assert!(
+                words.iter().any(|w| w == expected),
+                "Expected stop word '{}' not found",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_english_stop_words_no_duplicates() {
+        let words = english_stop_words();
+        let mut seen = std::collections::HashSet::new();
+        for word in &words {
+            assert!(seen.insert(word), "Duplicate stop word: '{}'", word);
+        }
+    }
+}
+
 /// Parse the `leading_strip:` or `trailing_strip:` char set from kwargs.
 pub fn get_strip_chars(kwargs: &RHash, key: &str) -> Result<Vec<char>, Error> {
     match kwargs.get(Symbol::new(key)) {

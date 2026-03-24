@@ -139,4 +139,43 @@ mod tests {
         let trailing = vec!['.', ','];
         assert_eq!(strip_punctuation(".,.,", &leading, &trailing), "");
     }
+
+    #[test]
+    fn test_strip_custom_chars() {
+        let leading = vec!['@', '#'];
+        let trailing = vec!['!', '?'];
+        assert_eq!(strip_punctuation("@#hello!?", &leading, &trailing), "hello");
+        assert_eq!(strip_punctuation("@@test??", &leading, &trailing), "test");
+        // Default chars should NOT be stripped when custom chars are provided
+        assert_eq!(strip_punctuation(".hello.", &leading, &trailing), ".hello.");
+    }
+
+    #[test]
+    fn test_strip_no_op_on_alpha() {
+        let leading = vec!['.', ',', ':', ';', '"', ')', '>', '<', '}', ']', '~', '+'];
+        let trailing = vec!['.', ',', ':', ';', '"', '(', '<', '>', '[', '{', '%'];
+        assert_eq!(strip_punctuation("hello", &leading, &trailing), "hello");
+        assert_eq!(strip_punctuation("Word", &leading, &trailing), "Word");
+    }
+
+    #[test]
+    fn test_strip_unicode_preserved() {
+        let leading = vec!['.'];
+        let trailing = vec!['.'];
+        // Non-ASCII alphanumeric chars should not be stripped (they're alphanumeric)
+        assert_eq!(strip_punctuation(".caf\u{00E9}.", &leading, &trailing), "caf\u{00E9}");
+        assert_eq!(strip_punctuation("\u{00FC}ber", &leading, &trailing), "\u{00FC}ber");
+    }
+
+    #[test]
+    fn test_strip_single_char_token() {
+        let leading = vec!['.', ','];
+        let trailing = vec!['.', ','];
+        // Single punctuation char → empty
+        assert_eq!(strip_punctuation(".", &leading, &trailing), "");
+        assert_eq!(strip_punctuation(",", &leading, &trailing), "");
+        // Single letter → preserved
+        assert_eq!(strip_punctuation("a", &leading, &trailing), "a");
+        assert_eq!(strip_punctuation("5", &leading, &trailing), "5");
+    }
 }
