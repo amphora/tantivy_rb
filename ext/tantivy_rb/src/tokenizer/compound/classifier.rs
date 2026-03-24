@@ -178,4 +178,15 @@ mod tests {
         assert_eq!(strip_punctuation("a", &leading, &trailing), "a");
         assert_eq!(strip_punctuation("5", &leading, &trailing), "5");
     }
+
+    #[test]
+    fn test_classify_pure_digits() {
+        // Pure-digit tokens are intentionally classified as COMPLEX (not WORD, not Skip).
+        // They have number_count > 0, letter_count == 0, so they don't match the WORD
+        // branch (letter_count == total) or the Skip branch (other_count == total).
+        // This enables n-gram expansion of numeric identifiers like page numbers.
+        assert_eq!(classify_token("12345"), TokenKind::Complex);
+        assert_eq!(classify_token("0"), TokenKind::Complex);
+        assert_eq!(classify_token("999"), TokenKind::Complex);
+    }
 }

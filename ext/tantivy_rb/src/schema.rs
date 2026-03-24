@@ -241,6 +241,55 @@ pub fn init(module: magnus::RModule) -> Result<(), Error> {
     Ok(())
 }
 
-// TODO:: [DEFERRED] Add #[cfg(test)] module with unit tests
-// Targets: double-build guard ("Schema already built"), hash option parsing
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_numeric_opts_defaults() {
+        let opts = build_numeric_opts(false, false, false);
+        assert!(!opts.is_stored());
+        assert!(!opts.is_indexed());
+        assert!(!opts.is_fast());
+    }
+
+    #[test]
+    fn test_build_numeric_opts_stored() {
+        let opts = build_numeric_opts(true, false, false);
+        assert!(opts.is_stored());
+        assert!(!opts.is_indexed());
+        assert!(!opts.is_fast());
+    }
+
+    #[test]
+    fn test_build_numeric_opts_indexed() {
+        let opts = build_numeric_opts(false, true, false);
+        assert!(!opts.is_stored());
+        assert!(opts.is_indexed());
+        assert!(!opts.is_fast());
+    }
+
+    #[test]
+    fn test_build_numeric_opts_fast() {
+        let opts = build_numeric_opts(false, false, true);
+        assert!(!opts.is_stored());
+        assert!(!opts.is_indexed());
+        assert!(opts.is_fast());
+    }
+
+    #[test]
+    fn test_build_numeric_opts_all() {
+        let opts = build_numeric_opts(true, true, true);
+        assert!(opts.is_stored());
+        assert!(opts.is_indexed());
+        assert!(opts.is_fast());
+    }
+}
+
+// TODO:: [DEFERRED] Add Ruby-dependent unit tests (requires magnus::embed)
+// Targets: double-build guard ("Schema already built"), hash_get_bool/hash_get_string,
+// parse_numeric_args
+// Reason: These functions use Magnus types (RHash, Value, Symbol) that require
+// an initialised Ruby VM.
+// Scope: 2
 // See: AMPHTT-731

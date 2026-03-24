@@ -575,7 +575,12 @@ mod tests {
         ]);
     }
 
-    // TODO:: [DEFERRED] Add unit tests for build_terms_query, build_phrase_query,
-    // owned_value_to_ruby (pure fn, multiple branches), and filter-clause construction
+    // TODO:: [DEFERRED] Add Ruby-dependent unit tests (requires magnus::embed or Ruby linking)
+    // Targets: build_terms_query, build_phrase_query, owned_value_to_ruby, filter-clause
+    // construction
+    // Reason: These functions take &RbIndex which is #[magnus::wrap]-annotated. Constructing
+    // RbIndex in tests causes linker errors due to unresolved Ruby symbols. Needs either
+    // embed feature flag or a refactor to accept &Index instead of &RbIndex.
+    // Scope: 3
     // See: AMPHTT-731
 }
