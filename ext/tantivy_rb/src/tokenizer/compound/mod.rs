@@ -13,6 +13,51 @@
 
 pub mod classifier;
 pub mod expander;
+
+/// Implements `TokenStream` for a buffered compound token stream.
+///
+/// Both `CompoundIndexTokenStream` and `CompoundQueryTokenStream` use the same
+/// buffer-draining pattern: `advance()` pulls tokens from `self.buffer`, and
+/// when exhausted calls `self.process_next_raw_token()` to refill it. The
+/// `token()` / `token_mut()` accessors are identical one-liners.
+///
+/// The macro requires the target struct to have:
+///   - `buffer: Vec<Token>`   — buffered output tokens
+///   - `buf_pos: usize`       — current position in buffer
+///   - `token: Token`         — the current output token
+///   - `fn process_next_raw_token(&mut self) -> bool` — fills the buffer
+macro_rules! impl_buffered_token_stream {
+    ($stream_type:ident <$lt:lifetime>) => {
+        impl<$lt> TokenStream for $stream_type<$lt> {
+            fn advance(&mut self) -> bool {
+                loop {
+                    if self.buf_pos < self.buffer.len() {
+                        let tok = &self.buffer[self.buf_pos];
+                        self.token.text.clear();
+                        self.token.text.push_str(&tok.text);
+                        self.token.position = tok.position;
+                        self.buf_pos += 1;
+                        return true;
+                    }
+                    self.buffer.clear();
+                    self.buf_pos = 0;
+                    if !self.process_next_raw_token() {
+                        return false;
+                    }
+                }
+            }
+
+            fn token(&self) -> &Token {
+                &self.token
+            }
+
+            fn token_mut(&mut self) -> &mut Token {
+                &mut self.token
+            }
+        }
+    };
+}
+
 pub mod query;
 pub mod stop_words;
 
@@ -253,36 +298,7 @@ impl<'a> CompoundIndexTokenStream<'a> {
     }
 }
 
-impl<'a> TokenStream for CompoundIndexTokenStream<'a> {
-    fn advance(&mut self) -> bool {
-        loop {
-            // Drain any buffered tokens first.
-            if self.buf_pos < self.buffer.len() {
-                let tok = &self.buffer[self.buf_pos];
-                self.token.text.clear();
-                self.token.text.push_str(&tok.text);
-                self.token.position = tok.position;
-                self.buf_pos += 1;
-                return true;
-            }
-
-            // Buffer exhausted — try to fill it from the next raw token.
-            self.buffer.clear();
-            self.buf_pos = 0;
-            if !self.process_next_raw_token() {
-                return false;
-            }
-        }
-    }
-
-    fn token(&self) -> &Token {
-        &self.token
-    }
-
-    fn token_mut(&mut self) -> &mut Token {
-        &mut self.token
-    }
-}
+impl_buffered_token_stream!(CompoundIndexTokenStream<'a>);
 
 /// Basic ASCII folding: replace common accented characters with ASCII equivalents.
 ///
