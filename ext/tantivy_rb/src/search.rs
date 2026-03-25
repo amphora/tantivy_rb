@@ -15,25 +15,26 @@ use crate::index::RbIndex;
 use magnus::{prelude::*, r_hash::ForEach, Error, Ruby, RArray, RHash, RString, Symbol, Value};
 use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, QueryParser, TermQuery};
-use tantivy::schema::{IndexRecordOption, OwnedValue};
+use tantivy::schema::{IndexRecordOption, OwnedValue, Schema};
 use tantivy::tokenizer::TokenStream;
-use tantivy::TantivyDocument;
+use tantivy::{DocAddress, Searcher, TantivyDocument};
 
-/// Execute a search query on the index.
-///
-/// Ruby signature:
-///   index.search(query_string, fields: [...], filter: {}, limit: 20, offset: 0)
-///
-/// Returns: { total: N, hits: [{ score: F, stored_fields: { ... } }, ...] }
-// TODO:: [DEFERRED] Decompose into parse_search_args, execute_query, marshal_results
-// Reason: ~177 lines mixing argument parsing, query construction, collection, and marshalling
-// See: AMPHTT-730
-pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, Error> {
-    // SAFETY: This function is only ever called from Ruby via the magnus method!
-    // macro, which guarantees execution on a Ruby GVL thread after magnus::init
-    // has completed. Ruby::get_unchecked() requires exactly this invariant.
-    let ruby = unsafe { Ruby::get_unchecked() };
+/// Parsed search arguments extracted from Ruby kwargs.
+struct SearchArgs {
+    query_string: String,
+    field_names: Vec<String>,
+    filter_hash: Option<RHash>,
+    limit: usize,
+    offset: usize,
+    query_tokenizer_name: Option<String>,
+}
 
+/// Parse Ruby arguments into a `SearchArgs` struct.
+///
+/// Expects at least one positional argument (the query string), with an optional
+/// kwargs hash containing `:fields`, `:filter`, `:limit`, `:offset`, and
+/// `:query_tokenizer`.
+fn parse_search_args(ruby_args: &[Value]) -> Result<SearchArgs, Error> {
     if ruby_args.is_empty() {
         return Err(Error::new(
             magnus::exception::arg_error(),
@@ -75,10 +76,26 @@ pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, 
         }
     }
 
-    let schema = rb_index.schema();
+    Ok(SearchArgs {
+        query_string,
+        field_names,
+        filter_hash,
+        limit,
+        offset,
+        query_tokenizer_name,
+    })
+}
 
-    let fields: Vec<tantivy::schema::Field> = if field_names.is_empty() {
-        schema
+/// Resolve field names to Tantivy `Field` objects.
+///
+/// If `field_names` is empty, returns all text fields from the schema.
+/// Otherwise, looks up each name and returns an error for unknown fields.
+fn resolve_fields(
+    schema: &Schema,
+    field_names: &[String],
+) -> Result<Vec<tantivy::schema::Field>, Error> {
+    if field_names.is_empty() {
+        Ok(schema
             .fields()
             .filter_map(|(field, entry)| {
                 if matches!(entry.field_type(), tantivy::schema::FieldType::Str(_)) {
@@ -87,7 +104,7 @@ pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, 
                     None
                 }
             })
-            .collect()
+            .collect())
     } else {
         field_names
             .iter()
@@ -99,22 +116,51 @@ pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, 
                     )
                 })
             })
-            .collect::<Result<Vec<_>, _>>()?
-    };
+            .collect::<Result<Vec<_>, _>>()
+    }
+}
 
-    let text_query: Box<dyn Query> = if let Some(ref tokenizer_name) = query_tokenizer_name {
-        build_tokenized_query(rb_index, &query_string, tokenizer_name, &fields)?
+/// Execute a search query on the index.
+///
+/// Ruby signature:
+///   index.search(query_string, fields: [...], filter: {}, limit: 20, offset: 0)
+///
+/// Returns: { total: N, hits: [{ score: F, stored_fields: { ... } }, ...] }
+pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, Error> {
+    let args = parse_search_args(ruby_args)?;
+    let fields = resolve_fields(rb_index.schema(), &args.field_names)?;
+    let query = build_full_query(rb_index, &args, &fields)?;
+    let searcher = rb_index.reader().searcher();
+    let (scored_docs, total) =
+        collect_search_results(&searcher, &*query, args.limit, args.offset)?;
+    marshal_results(rb_index.schema(), &searcher, &scored_docs, total)
+}
+
+/// Build the complete search query: text query + optional filter clauses.
+///
+/// Constructs the text query using either the built-in `QueryParser` or a custom
+/// tokenizer (if `query_tokenizer` was specified), then wraps it with filter
+/// term clauses if a `filter:` hash was provided.
+fn build_full_query(
+    rb_index: &RbIndex,
+    args: &SearchArgs,
+    fields: &[tantivy::schema::Field],
+) -> Result<Box<dyn Query>, Error> {
+    let schema = rb_index.schema();
+
+    let text_query: Box<dyn Query> = if let Some(ref tokenizer_name) = args.query_tokenizer_name {
+        build_tokenized_query(rb_index, &args.query_string, tokenizer_name, fields)?
     } else {
-        let query_parser = QueryParser::for_index(rb_index.index(), fields.clone());
-        query_parser.parse_query(&query_string).map_err(|e| {
+        let query_parser = QueryParser::for_index(rb_index.index(), fields.to_vec());
+        query_parser.parse_query(&args.query_string).map_err(|e| {
             Error::new(
                 magnus::exception::arg_error(),
-                format!("Failed to parse query '{}': {}", query_string, e),
+                format!("Failed to parse query '{}': {}", args.query_string, e),
             )
         })?
     };
 
-    let final_query: Box<dyn Query> = if let Some(fh) = filter_hash {
+    if let Some(ref fh) = args.filter_hash {
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         clauses.push((Occur::Must, text_query));
 
@@ -145,20 +191,29 @@ pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, 
             Ok(ForEach::Continue)
         })?;
 
-        Box::new(BooleanQuery::new(clauses))
+        Ok(Box::new(BooleanQuery::new(clauses)))
     } else {
-        text_query
-    };
+        Ok(text_query)
+    }
+}
 
-    let searcher = rb_index.reader().searcher();
-
-    // Use MultiCollector to gather TopDocs and Count in a single index scan.
+/// Execute the search query and collect scored documents + total count.
+///
+/// Uses `MultiCollector` to gather `TopDocs` and `Count` in a single index scan.
+/// The `offset` is applied by fetching `limit + offset` results and skipping the
+/// first `offset` entries.
+fn collect_search_results(
+    searcher: &Searcher,
+    query: &dyn Query,
+    limit: usize,
+    offset: usize,
+) -> Result<(Vec<(f32, DocAddress)>, usize), Error> {
     let fetch_count = limit + offset;
     let mut multi = MultiCollector::new();
     let top_docs_handle = multi.add_collector(TopDocs::with_limit(fetch_count));
     let count_handle = multi.add_collector(Count);
 
-    let mut multi_fruit = searcher.search(&*final_query, &multi).map_err(|e| {
+    let mut multi_fruit = searcher.search(query, &multi).map_err(|e| {
         Error::new(
             magnus::exception::runtime_error(),
             format!("Search failed: {}", e),
@@ -168,8 +223,27 @@ pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, 
     let top_docs = top_docs_handle.extract(&mut multi_fruit);
     let total = count_handle.extract(&mut multi_fruit);
 
+    let scored_docs: Vec<(f32, DocAddress)> = top_docs.into_iter().skip(offset).collect();
+    Ok((scored_docs, total))
+}
+
+/// Convert search results into a Ruby hash with `:total` and `:hits` keys.
+///
+/// Each hit contains `:score` (float) and `:stored_fields` (hash of field
+/// name -> value for all stored fields in the document).
+fn marshal_results(
+    schema: &Schema,
+    searcher: &Searcher,
+    scored_docs: &[(f32, DocAddress)],
+    total: usize,
+) -> Result<RHash, Error> {
+    // SAFETY: This function is only ever called from Ruby via the magnus method!
+    // macro, which guarantees execution on a Ruby GVL thread after magnus::init
+    // has completed. Ruby::get_unchecked() requires exactly this invariant.
+    let ruby = unsafe { Ruby::get_unchecked() };
+
     let hits = RArray::new();
-    for (score, doc_address) in top_docs.into_iter().skip(offset) {
+    for &(score, doc_address) in scored_docs {
         let doc: TantivyDocument = searcher.doc(doc_address).map_err(|e| {
             Error::new(
                 magnus::exception::runtime_error(),
@@ -576,11 +650,12 @@ mod tests {
     }
 
     // TODO:: [DEFERRED] Add Ruby-dependent unit tests (requires magnus::embed or Ruby linking)
-    // Targets: build_terms_query, build_phrase_query, owned_value_to_ruby, filter-clause
-    // construction
-    // Reason: These functions take &RbIndex which is #[magnus::wrap]-annotated. Constructing
-    // RbIndex in tests causes linker errors due to unresolved Ruby symbols. Needs either
-    // embed feature flag or a refactor to accept &Index instead of &RbIndex.
+    // Targets: parse_search_args, resolve_fields, build_full_query, collect_search_results,
+    // marshal_results, build_terms_query, build_phrase_query, owned_value_to_ruby
+    // Reason: These functions use Magnus types (RHash, Value, Error) or take &RbIndex which is
+    // #[magnus::wrap]-annotated. Constructing these in tests causes linker errors due to
+    // unresolved Ruby symbols. Needs either embed feature flag or a refactor to accept plain
+    // Tantivy types instead of Magnus wrappers.
     // Scope: 3
     // See: AMPHTT-731
 }
