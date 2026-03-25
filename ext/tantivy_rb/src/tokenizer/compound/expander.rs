@@ -59,13 +59,12 @@ impl CharBlock {
     }
 }
 
-/// Parse a string into character-type blocks.
+/// Parse a character slice into character-type blocks.
 ///
 /// Each contiguous run of the same character type becomes one block, except that
 /// OTHER characters always form their own boundary (like in the Java impl where
 /// OTHER triggers a new block at every character boundary change).
-fn parse_as_blocks(text: &str) -> Vec<CharBlock> {
-    let chars: Vec<char> = text.chars().collect();
+fn parse_as_blocks(chars: &[char]) -> Vec<CharBlock> {
     if chars.is_empty() {
         return Vec::new();
     }
@@ -121,7 +120,7 @@ pub fn expand_complex_token(token: &str) -> Vec<String> {
     // Always start with the full token
     result.push(token.to_string());
 
-    let blocks = parse_as_blocks(token);
+    let blocks = parse_as_blocks(&chars);
 
     for start_idx in 0..blocks.len() {
         let start_block = &blocks[start_idx];
@@ -169,7 +168,8 @@ mod tests {
 
     #[test]
     fn test_parse_blocks_simple() {
-        let blocks = parse_as_blocks("abc123");
+        let chars: Vec<char> = "abc123".chars().collect();
+        let blocks = parse_as_blocks(&chars);
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].char_type, CharType::Letter);
         assert_eq!(blocks[0].start, 0);
@@ -181,7 +181,8 @@ mod tests {
 
     #[test]
     fn test_parse_blocks_with_separator() {
-        let blocks = parse_as_blocks("abc/def");
+        let chars: Vec<char> = "abc/def".chars().collect();
+        let blocks = parse_as_blocks(&chars);
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0].char_type, CharType::Letter);
         assert_eq!(blocks[1].char_type, CharType::Other);
