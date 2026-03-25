@@ -194,23 +194,9 @@ impl<'a> TokenStream for CompoundQueryTokenStream<'a> {
 /// Preserves *, ?, and " (wildcard and phrase characters).
 ///
 /// Ported from Java PreOrPostPunctuationStripFilter.
-fn strip_query_punctuation(token: &str) -> String {
-    let chars: Vec<char> = token.chars().collect();
-    let mut start = 0;
-    let mut end = chars.len();
-
-    while start < end && is_query_filtered_char(chars[start]) {
-        start += 1;
-    }
-    while end > start && is_query_filtered_char(chars[end - 1]) {
-        end -= 1;
-    }
-
-    if end <= start {
-        return String::new();
-    }
-
-    chars[start..end].iter().collect()
+fn strip_query_punctuation(token: &str) -> &str {
+    let trimmed = token.trim_start_matches(is_query_filtered_char);
+    trimmed.trim_end_matches(is_query_filtered_char)
 }
 
 /// Characters that are filtered from query tokens.

@@ -15,19 +15,9 @@ pub enum TokenKind {
 /// Strip configurable leading and trailing punctuation characters from a token.
 ///
 /// Ported from Java BlockTokenParsingFilter.isRemovableStartCharacter / isRemovableEndCharacter.
-pub fn strip_punctuation(token: &str, leading: &[char], trailing: &[char]) -> String {
-    let chars: Vec<char> = token.chars().collect();
-    let mut start = 0;
-    let mut end = chars.len();
-
-    while start < end && is_removable_start(chars[start], leading) {
-        start += 1;
-    }
-    while end > start && is_removable_end(chars[end - 1], trailing) {
-        end -= 1;
-    }
-
-    chars[start..end].iter().collect()
+pub fn strip_punctuation<'a>(token: &'a str, leading: &[char], trailing: &[char]) -> &'a str {
+    let trimmed = token.trim_start_matches(|c: char| is_removable_start(c, leading));
+    trimmed.trim_end_matches(|c: char| is_removable_end(c, trailing))
 }
 
 /// Classify a (already-stripped) token as WORD, COMPLEX, or Skip.
