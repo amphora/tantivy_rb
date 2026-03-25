@@ -159,36 +159,7 @@ impl<'a> CompoundQueryTokenStream<'a> {
     }
 }
 
-impl<'a> TokenStream for CompoundQueryTokenStream<'a> {
-    fn advance(&mut self) -> bool {
-        loop {
-            // Drain any buffered tokens first.
-            if self.buf_pos < self.buffer.len() {
-                let tok = &self.buffer[self.buf_pos];
-                self.token.text.clear();
-                self.token.text.push_str(&tok.text);
-                self.token.position = tok.position;
-                self.buf_pos += 1;
-                return true;
-            }
-
-            // Buffer exhausted — try to fill it from the next raw token.
-            self.buffer.clear();
-            self.buf_pos = 0;
-            if !self.process_next_raw_token() {
-                return false;
-            }
-        }
-    }
-
-    fn token(&self) -> &Token {
-        &self.token
-    }
-
-    fn token_mut(&mut self) -> &mut Token {
-        &mut self.token
-    }
-}
+impl_buffered_token_stream!(CompoundQueryTokenStream<'a>);
 
 /// Strip leading/trailing punctuation from query tokens.
 /// Preserves *, ?, and " (wildcard and phrase characters).
