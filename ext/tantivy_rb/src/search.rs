@@ -263,16 +263,16 @@ fn marshal_results(
                 continue;
             }
             let field_name = entry.name();
-            let values: Vec<&OwnedValue> = doc.get_all(field).collect();
+            let values: Vec<OwnedValue> = doc.get_all(field).map(OwnedValue::from).collect();
             if values.is_empty() {
                 continue;
             }
             if values.len() == 1 {
-                let ruby_val = owned_value_to_ruby(values[0], &ruby)?;
+                let ruby_val = owned_value_to_ruby(&values[0], &ruby)?;
                 stored.aset(field_name.to_string(), ruby_val)?;
             } else {
                 let arr = RArray::new();
-                for v in values {
+                for v in &values {
                     arr.push(owned_value_to_ruby(v, &ruby)?)?;
                 }
                 stored.aset(field_name.to_string(), arr)?;
