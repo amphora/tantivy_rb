@@ -29,7 +29,8 @@ module TantivyRb
         "Failed to load tantivy_rb native extension. " \
         "Tried #{ruby_api_version}/ and unversioned paths. " \
         "Run `cd ext/tantivy_rb && cargo build --release` to compile. " \
-        "Original error: #{e.message}"
+        "Original error: #{e.message}",
+        e.backtrace
     end
   end
 end

@@ -437,17 +437,19 @@ fn build_phrase_query(
 
     // Single token — fall back to a term query (phrase needs ≥2 terms).
     if position_terms.len() == 1 {
-        let token_text = position_terms.into_values().next()
-            .expect("len checked to be 1");
-        let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        for &field in fields {
-            let term = tantivy::Term::from_field_text(field, &token_text);
-            field_clauses.push((
-                Occur::Should,
-                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
-            ));
+        if let Some(token_text) = position_terms.into_values().next() {
+            let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+            for &field in fields {
+                let term = tantivy::Term::from_field_text(field, &token_text);
+                field_clauses.push((
+                    Occur::Should,
+                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+                ));
+            }
+            return Ok(Some(Box::new(BooleanQuery::new(field_clauses))));
+        } else {
+            return Ok(None);
         }
-        return Ok(Some(Box::new(BooleanQuery::new(field_clauses))));
     }
 
     // Build a PhraseQuery per field, OR'd together.

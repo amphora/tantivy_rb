@@ -148,7 +148,12 @@ impl RbIndex {
         let mut guard = self.writer.lock().map_err(|e| {
             Error::new(
                 magnus::exception::runtime_error(),
-                format!("Failed to lock writer mutex: {}", e),
+                format!(
+                    "Failed to lock writer mutex (poisoned): a previous operation panicked while \
+                     holding the lock, leaving the index in a potentially inconsistent state. \
+                     Consider rebuilding the index. Original error: {}",
+                    e
+                ),
             )
         })?;
         if guard.is_none() {
@@ -290,7 +295,12 @@ impl RbIndex {
         let mut guard = self.writer.lock().map_err(|e| {
             Error::new(
                 magnus::exception::runtime_error(),
-                format!("Failed to lock writer mutex: {}", e),
+                format!(
+                    "Failed to lock writer mutex (poisoned): a previous operation panicked while \
+                     holding the lock, leaving the index in a potentially inconsistent state. \
+                     Consider rebuilding the index. Original error: {}",
+                    e
+                ),
             )
         })?;
         *guard = None;
