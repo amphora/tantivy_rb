@@ -1,13 +1,14 @@
 [package]
 name = "tantivy_rb"
-version = "0.1.0"
+# Keep in sync with lib/tantivy_rb/version.rb
+version = "0.7.2"
 edition = "2021"
 publish = false
 description = "Ruby native extension wrapping the Tantivy full-text search engine via magnus/rb-sys"
 authors = ["Amphora Research Systems <dev@amphora.net>"]
 license = "Proprietary"
 readme = "../../README.md"
-rust-version = "1.75"
+rust-version = "1.80"
 
 [lib]
 crate-type = ["cdylib"]
