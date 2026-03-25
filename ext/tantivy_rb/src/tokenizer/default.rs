@@ -8,6 +8,8 @@
 //! or n-gram expansion. Also provides shared helpers (`get_stemmer_lang`,
 //! `get_stop_words`, `get_strip_chars`) used by other tokenizer types.
 
+use std::sync::LazyLock;
+
 use magnus::{Error, RHash, Symbol};
 use rust_stemmers::Algorithm;
 use tantivy::tokenizer::*;
@@ -104,7 +106,7 @@ pub fn get_stop_words(kwargs: &RHash) -> Result<Vec<String>, Error> {
                     Error::new(magnus::exception::runtime_error(), format!("{}", e))
                 })?.to_string();
                 match name.to_lowercase().as_str() {
-                    "english" => Ok(english_stop_words()),
+                    "english" => Ok(english_stop_words().to_vec()),
                     _ => Err(Error::new(
                         magnus::exception::arg_error(),
                         format!("Unknown stop words language: {}", name),
@@ -121,12 +123,15 @@ pub fn get_stop_words(kwargs: &RHash) -> Result<Vec<String>, Error> {
                 Ok(words)
             }
         }
-        None => Ok(english_stop_words()),
+        None => Ok(english_stop_words().to_vec()),
     }
 }
 
 /// Lucene 3.6-compatible English stop words (matches the Java SkippingStopFilter).
-pub fn english_stop_words() -> Vec<String> {
+///
+/// Backed by a `LazyLock` static — the list is allocated once on first access.
+/// Returns a borrowed slice; callers that need ownership should call `.to_vec()`.
+static ENGLISH_STOP_WORDS: LazyLock<Vec<String>> = LazyLock::new(|| {
     vec![
         "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "if", "in", "into", "is",
         "it", "no", "not", "of", "on", "or", "such", "that", "the", "their", "then", "there",
@@ -135,6 +140,10 @@ pub fn english_stop_words() -> Vec<String> {
     .into_iter()
     .map(String::from)
     .collect()
+});
+
+pub fn english_stop_words() -> &'static [String] {
+    &ENGLISH_STOP_WORDS
 }
 
 #[cfg(test)]
@@ -163,7 +172,7 @@ mod tests {
     fn test_english_stop_words_no_duplicates() {
         let words = english_stop_words();
         let mut seen = std::collections::HashSet::new();
-        for word in &words {
+        for word in words {
             assert!(seen.insert(word), "Duplicate stop word: '{}'", word);
         }
     }

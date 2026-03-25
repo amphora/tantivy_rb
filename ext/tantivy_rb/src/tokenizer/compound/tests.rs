@@ -22,7 +22,7 @@ mod index_tokenizer_tests {
         CompoundIndexTokenizer::new(
             default_leading(),
             default_trailing(),
-            english_stop_words(),
+            english_stop_words().to_vec(),
             Algorithm::English,
         )
     }
@@ -568,7 +568,7 @@ mod query_tokenizer_tests {
     use tantivy::tokenizer::{TokenStream, Tokenizer};
 
     fn make_tokenizer() -> CompoundQueryTokenizer {
-        CompoundQueryTokenizer::new(english_stop_words(), Algorithm::English)
+        CompoundQueryTokenizer::new(english_stop_words().to_vec(), Algorithm::English)
     }
 
     fn token_texts(text: &str) -> Vec<String> {
