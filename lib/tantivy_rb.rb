@@ -10,22 +10,28 @@
 
 require_relative "tantivy_rb/version"
 
-# Load the compiled Rust native extension. rb_sys places the .so under a
-# Ruby-version-specific directory (e.g. tantivy_rb/3.3/tantivy_rb.so);
-# fall back to the unversioned path for development builds.
-# TODO:: [DEFERRED] Add unit test for load fallback logic (stub require to simulate LoadError)
-# See: AMPHTT-732
-begin
-  ruby_api_version = RUBY_VERSION[/\d+\.\d+/]
-  require "tantivy_rb/#{ruby_api_version}/tantivy_rb"
-rescue LoadError
-  begin
-    require "tantivy_rb/tantivy_rb"
-  rescue LoadError => e
-    raise LoadError,
-      "Failed to load tantivy_rb native extension. " \
-      "Tried #{ruby_api_version}/ and unversioned paths. " \
-      "Run `cd ext/tantivy_rb && cargo build --release` to compile. " \
-      "Original error: #{e.message}"
+module TantivyRb
+  # Load the compiled Rust native extension. rb_sys places the .so under a
+  # Ruby-version-specific directory (e.g. tantivy_rb/3.3/tantivy_rb.so);
+  # fall back to the unversioned path for development builds.
+  #
+  # The +loader+ parameter accepts any callable that behaves like +require+.
+  # Production code uses the default (Kernel#require); tests inject a fake
+  # to simulate LoadError on specific paths.
+  def self.load_native_extension(loader: method(:require))
+    ruby_api_version = RUBY_VERSION[/\d+\.\d+/]
+    loader.call("tantivy_rb/#{ruby_api_version}/tantivy_rb")
+  rescue LoadError
+    begin
+      loader.call("tantivy_rb/tantivy_rb")
+    rescue LoadError => e
+      raise LoadError,
+        "Failed to load tantivy_rb native extension. " \
+        "Tried #{ruby_api_version}/ and unversioned paths. " \
+        "Run `cd ext/tantivy_rb && cargo build --release` to compile. " \
+        "Original error: #{e.message}"
+    end
   end
 end
+
+TantivyRb.load_native_extension
