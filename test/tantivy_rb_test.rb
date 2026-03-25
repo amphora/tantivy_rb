@@ -35,6 +35,18 @@ class TantivyRbTest < Minitest::Test
     assert_includes error.message, "Tried #{RUBY_VERSION[/\d+\.\d+/]}/ and unversioned paths"
   end
 
+  def test_preserves_backtrace_when_both_paths_fail
+    loader, _attempted = build_loader(succeed_on: [])
+
+    error = assert_raises(LoadError) do
+      TantivyRb.load_native_extension(loader: loader)
+    end
+
+    refute_nil error.backtrace
+    assert error.backtrace.any? { |line| line.include?("tantivy_rb.rb") },
+      "Expected backtrace to include tantivy_rb.rb"
+  end
+
   private
 
   def build_loader(succeed_on:)
