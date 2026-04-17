@@ -179,12 +179,12 @@ fn build_full_query(
 /// Build a single filter clause for one `(field_name, value)` entry in the `filter:` hash.
 ///
 /// Dispatches on the Ruby value type:
+/// - `Array` → OR-joined `TermQuery` clauses via a Should-BooleanQuery.
 /// - `String` → exact-match `TermQuery` on a text field.
-/// - (Future commits) `Array` → OR of TermQueries; `Hash` → range or prefix query.
+/// - (Future commits) `Hash` → range or prefix query.
 ///
-/// Returns `Ok(None)` when the entry is a no-op (e.g. empty array, empty prefix in
-/// future commits). The caller should skip — no clause is added to the outer
-/// BooleanQuery.
+/// Returns `Ok(None)` when the entry is a no-op (e.g. empty array). The caller
+/// should skip — no clause is added to the outer BooleanQuery.
 ///
 /// Field-type validation (e.g. "text field only" for term filters) is performed
 /// inside this function using `schema.get_field_entry(field).field_type()`.
@@ -200,6 +200,12 @@ fn build_filter_clause(
         )
     })?;
 
+    // Array-valued filter → OR of TermQueries. Checked before String so an
+    // accidental Array input can't be stringified.
+    if let Ok(arr) = <RArray as magnus::TryConvert>::try_convert(value) {
+        return build_array_filter(schema, field, field_name, arr);
+    }
+
     // String-valued filter → exact-match TermQuery (existing behaviour).
     if let Ok(s) = <String as magnus::TryConvert>::try_convert(value) {
         return build_term_filter(schema, field, field_name, &s).map(Some);
@@ -208,7 +214,7 @@ fn build_filter_clause(
     Err(Error::new(
         magnus::exception::arg_error(),
         format!(
-            "Unsupported filter value for field '{}': expected a String",
+            "Unsupported filter value for field '{}': expected a String or Array",
             field_name
         ),
     ))
@@ -233,6 +239,60 @@ fn build_term_filter(
     }
     let term = tantivy::Term::from_field_text(field, value);
     Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic)))
+}
+
+/// Build an OR-joined filter from a Ruby Array of string values.
+///
+/// Each element becomes a `TermQuery` joined with `Occur::Should` inside a
+/// `BooleanQuery`, so a document matches if ANY of the listed terms matches.
+/// The outer filter loop then joins this (as `Must`) with the text query and
+/// other filter clauses, yielding `text AND (term1 OR term2 OR ...)`.
+///
+/// Degenerate cases:
+/// - Empty array → `Ok(None)` (no clause added — equivalent to "no filter on
+///   this field"). This lets callers pass an empty multi-select without
+///   special-casing at the call site.
+/// - Single-element array → behaves identically to a bare string value.
+fn build_array_filter(
+    schema: &Schema,
+    field: tantivy::schema::Field,
+    field_name: &str,
+    arr: RArray,
+) -> Result<Option<Box<dyn Query>>, Error> {
+    let field_entry = schema.get_field_entry(field);
+    if !matches!(field_entry.field_type(), tantivy::schema::FieldType::Str(_)) {
+        return Err(Error::new(
+            magnus::exception::arg_error(),
+            format!(
+                "Filter field '{}' is not a text field. Only text fields are supported in array filter:",
+                field_name
+            ),
+        ));
+    }
+
+    if arr.is_empty() {
+        return Ok(None);
+    }
+
+    let mut term_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(arr.len());
+    for element in arr.into_iter() {
+        let s: String = magnus::TryConvert::try_convert(element).map_err(|_| {
+            Error::new(
+                magnus::exception::arg_error(),
+                format!(
+                    "Array filter for field '{}' contains a non-String element",
+                    field_name
+                ),
+            )
+        })?;
+        let term = tantivy::Term::from_field_text(field, &s);
+        term_clauses.push((
+            Occur::Should,
+            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+        ));
+    }
+
+    Ok(Some(Box::new(BooleanQuery::new(term_clauses))))
 }
 
 /// Execute the search query and collect scored documents + total count.
