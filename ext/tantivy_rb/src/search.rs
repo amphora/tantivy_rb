@@ -164,28 +164,9 @@ fn build_full_query(
 
         fh.foreach(|key: Value, value: Value| {
             let field_name: String = magnus::TryConvert::try_convert(key)?;
-            let field_value: String = magnus::TryConvert::try_convert(value)?;
-            let field = schema.get_field(&field_name).map_err(|_| {
-                Error::new(
-                    magnus::exception::arg_error(),
-                    format!("Unknown filter field: {}", field_name),
-                )
-            })?;
-            let field_entry = schema.get_field_entry(field);
-            if !matches!(field_entry.field_type(), tantivy::schema::FieldType::Str(_)) {
-                return Err(Error::new(
-                    magnus::exception::arg_error(),
-                    format!(
-                        "Filter field '{}' is not a text field. Only text fields are supported in filter:",
-                        field_name
-                    ),
-                ));
+            if let Some(clause) = build_filter_clause(schema, &field_name, value)? {
+                clauses.push((Occur::Must, clause));
             }
-            let term = tantivy::Term::from_field_text(field, &field_value);
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-            ));
             Ok(ForEach::Continue)
         })?;
 
@@ -193,6 +174,65 @@ fn build_full_query(
     } else {
         Ok(text_query)
     }
+}
+
+/// Build a single filter clause for one `(field_name, value)` entry in the `filter:` hash.
+///
+/// Dispatches on the Ruby value type:
+/// - `String` → exact-match `TermQuery` on a text field.
+/// - (Future commits) `Array` → OR of TermQueries; `Hash` → range or prefix query.
+///
+/// Returns `Ok(None)` when the entry is a no-op (e.g. empty array, empty prefix in
+/// future commits). The caller should skip — no clause is added to the outer
+/// BooleanQuery.
+///
+/// Field-type validation (e.g. "text field only" for term filters) is performed
+/// inside this function using `schema.get_field_entry(field).field_type()`.
+fn build_filter_clause(
+    schema: &Schema,
+    field_name: &str,
+    value: Value,
+) -> Result<Option<Box<dyn Query>>, Error> {
+    let field = schema.get_field(field_name).map_err(|_| {
+        Error::new(
+            magnus::exception::arg_error(),
+            format!("Unknown filter field: {}", field_name),
+        )
+    })?;
+
+    // String-valued filter → exact-match TermQuery (existing behaviour).
+    if let Ok(s) = <String as magnus::TryConvert>::try_convert(value) {
+        return build_term_filter(schema, field, field_name, &s).map(Some);
+    }
+
+    Err(Error::new(
+        magnus::exception::arg_error(),
+        format!(
+            "Unsupported filter value for field '{}': expected a String",
+            field_name
+        ),
+    ))
+}
+
+/// Build an exact-match `TermQuery` for a text field.
+fn build_term_filter(
+    schema: &Schema,
+    field: tantivy::schema::Field,
+    field_name: &str,
+    value: &str,
+) -> Result<Box<dyn Query>, Error> {
+    let field_entry = schema.get_field_entry(field);
+    if !matches!(field_entry.field_type(), tantivy::schema::FieldType::Str(_)) {
+        return Err(Error::new(
+            magnus::exception::arg_error(),
+            format!(
+                "Filter field '{}' is not a text field. Only text fields are supported in filter:",
+                field_name
+            ),
+        ));
+    }
+    let term = tantivy::Term::from_field_text(field, value);
+    Ok(Box::new(TermQuery::new(term, IndexRecordOption::Basic)))
 }
 
 /// Execute the search query and collect scored documents + total count.
