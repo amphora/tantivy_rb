@@ -15,7 +15,9 @@ use crate::index::{parse_date, RbIndex};
 use magnus::{prelude::*, r_hash::ForEach, Error, RArray, RHash, RString, Ruby, Symbol, Value};
 use std::ops::Bound;
 use tantivy::collector::{Count, MultiCollector, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery, TermQuery};
+use tantivy::query::{
+    BooleanQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery, RegexQuery, TermQuery,
+};
 use tantivy::schema::{IndexRecordOption, OwnedValue, Schema};
 use tantivy::tokenizer::TokenStream;
 use tantivy::{DocAddress, Searcher, TantivyDocument};
@@ -232,7 +234,7 @@ fn build_filter_clause(
 ///
 /// Accepted key sets:
 /// - Any of `:gte`, `:gt`, `:lte`, `:lt` → range query (date fields only).
-/// - `:prefix` → prefix query (future commit).
+/// - `:prefix` → prefix query (raw-tokenized text fields only).
 ///
 /// Unknown or empty key sets raise a descriptive error listing the accepted
 /// keys, so a typo like `{ "grt" => "..." }` fails fast rather than silently
@@ -243,10 +245,15 @@ fn build_hash_filter(
     field_name: &str,
     hash: RHash,
 ) -> Result<Option<Box<dyn Query>>, Error> {
+    let has_prefix = hash.get(Symbol::new("prefix")).is_some();
     let has_gte = hash.get(Symbol::new("gte")).is_some();
     let has_gt = hash.get(Symbol::new("gt")).is_some();
     let has_lte = hash.get(Symbol::new("lte")).is_some();
     let has_lt = hash.get(Symbol::new("lt")).is_some();
+
+    if has_prefix {
+        return build_prefix_filter(schema, field, field_name, &hash);
+    }
 
     if has_gte || has_gt || has_lte || has_lt {
         return build_range_filter(schema, field, field_name, &hash);
@@ -255,7 +262,7 @@ fn build_hash_filter(
     Err(Error::new(
         magnus::exception::arg_error(),
         format!(
-            "Unsupported filter hash for field '{}' — expected :gte, :gt, :lte, or :lt",
+            "Unsupported filter hash for field '{}' — expected :prefix, :gte, :gt, :lte, or :lt",
             field_name
         ),
     ))
@@ -437,6 +444,125 @@ fn hash_date_bound(
         )
     })?;
     parse_date(&s).map(Some)
+}
+
+/// Build a prefix-match filter from a Hash with a `:prefix` key.
+///
+/// Produces a `RegexQuery` of the shape `escaped_prefix.*`. The tantivy_fst
+/// regex engine matches the WHOLE token by default (implicit anchoring), so
+/// `"EXP\\-2026.*"` matches any token that starts with `"EXP-2026"` — exactly
+/// the prefix semantics we want.
+///
+/// Restricted to text fields with the `"raw"` tokenizer. On a tokenized field
+/// (e.g. `label`, which uses `ps_index`), the stored tokens are per-word, not
+/// per-document-id, and a prefix query would match any word starting with the
+/// prefix — confusing and rarely what the caller means. Rather than silently
+/// producing odd results, reject with a clear error.
+///
+/// Edge cases:
+/// - Empty prefix → `Ok(None)` (no clause added — equivalent to "no filter").
+/// - Non-String value for `:prefix` → ArgumentError.
+fn build_prefix_filter(
+    schema: &Schema,
+    field: tantivy::schema::Field,
+    field_name: &str,
+    hash: &RHash,
+) -> Result<Option<Box<dyn Query>>, Error> {
+    let field_entry = schema.get_field_entry(field);
+    let tokenizer = match field_entry.field_type() {
+        tantivy::schema::FieldType::Str(text_opts) => text_opts
+            .get_indexing_options()
+            .map(|opts| opts.tokenizer()),
+        _ => {
+            return Err(Error::new(
+                magnus::exception::arg_error(),
+                format!(
+                    "Prefix filter on field '{}' requires a text field",
+                    field_name
+                ),
+            ));
+        }
+    };
+    if tokenizer != Some("raw") {
+        return Err(Error::new(
+            magnus::exception::arg_error(),
+            format!(
+                "Prefix filter on field '{}' requires the 'raw' tokenizer",
+                field_name
+            ),
+        ));
+    }
+
+    // Safe: build_hash_filter only calls us when :prefix is present.
+    let prefix_val = hash
+        .get(Symbol::new("prefix"))
+        .expect("build_prefix_filter requires :prefix key");
+    let prefix: String = magnus::TryConvert::try_convert(prefix_val).map_err(|_| {
+        Error::new(
+            magnus::exception::arg_error(),
+            format!(
+                "Prefix filter for field '{}' expects a String for :prefix",
+                field_name
+            ),
+        )
+    })?;
+
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+
+    let pattern = format!("{}.*", escape_prefix_to_regex(&prefix));
+    let query = RegexQuery::from_pattern(&pattern, field).map_err(|e| {
+        Error::new(
+            magnus::exception::runtime_error(),
+            format!(
+                "Failed to build prefix RegexQuery for field '{}': {}",
+                field_name, e
+            ),
+        )
+    })?;
+    Ok(Some(Box::new(query)))
+}
+
+/// Escape regex metacharacters in a prefix string so it matches literally.
+///
+/// PatentSafe IDs contain characters like `-` that are not regex metacharacters
+/// in most dialects but ARE in the tantivy_fst regex grammar (inside character
+/// classes). To be safe and consistent with well-known regex escape semantics,
+/// escape every character that has special meaning in standard regex syntax:
+///
+///   \  .  +  *  ?  (  )  |  [  ]  {  }  ^  $  #  &  -  ~
+///
+/// This matches the set used by `regex_syntax::escape_into`, so behaviour is
+/// predictable for callers familiar with Rust's `regex` crate.
+fn escape_prefix_to_regex(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '\\' | '.'
+                | '+'
+                | '*'
+                | '?'
+                | '('
+                | ')'
+                | '|'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '^'
+                | '$'
+                | '#'
+                | '&'
+                | '-'
+                | '~'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Execute the search query and collect scored documents + total count.
@@ -902,6 +1028,49 @@ mod tests {
                 "Cryptographic Controls and Key Management Policy".into()
             ),]
         );
+    }
+
+    #[test]
+    fn test_escape_prefix_alphanumeric_noop() {
+        assert_eq!(escape_prefix_to_regex("EXP2026"), "EXP2026");
+        assert_eq!(escape_prefix_to_regex("abcXYZ123"), "abcXYZ123");
+    }
+
+    #[test]
+    fn test_escape_prefix_patentsafe_id() {
+        assert_eq!(escape_prefix_to_regex("EXP-2026"), "EXP\\-2026");
+        assert_eq!(escape_prefix_to_regex("DEVC01-000"), "DEVC01\\-000");
+    }
+
+    #[test]
+    fn test_escape_prefix_dot_escaped() {
+        assert_eq!(escape_prefix_to_regex("v1.2"), "v1\\.2");
+    }
+
+    #[test]
+    fn test_escape_prefix_all_regex_metacharacters() {
+        // Every metachar gets a leading backslash.
+        assert_eq!(
+            escape_prefix_to_regex(".+*?()|[]{}^$#&-~"),
+            "\\.\\+\\*\\?\\(\\)\\|\\[\\]\\{\\}\\^\\$\\#\\&\\-\\~"
+        );
+    }
+
+    #[test]
+    fn test_escape_prefix_backslash_escaped() {
+        assert_eq!(escape_prefix_to_regex("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn test_escape_prefix_empty_string() {
+        assert_eq!(escape_prefix_to_regex(""), "");
+    }
+
+    #[test]
+    fn test_escape_prefix_preserves_non_ascii() {
+        // Non-ASCII characters like é or 中 have no regex meaning and pass through.
+        assert_eq!(escape_prefix_to_regex("café"), "café");
+        assert_eq!(escape_prefix_to_regex("中文"), "中文");
     }
 
     // TODO:: [DEFERRED] Add Ruby-dependent unit tests (requires magnus::embed or Ruby linking)
