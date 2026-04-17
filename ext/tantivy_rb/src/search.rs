@@ -245,17 +245,14 @@ fn build_hash_filter(
     field_name: &str,
     hash: RHash,
 ) -> Result<Option<Box<dyn Query>>, Error> {
-    let has_prefix = hash.get(Symbol::new("prefix")).is_some();
-    let has_gte = hash.get(Symbol::new("gte")).is_some();
-    let has_gt = hash.get(Symbol::new("gt")).is_some();
-    let has_lte = hash.get(Symbol::new("lte")).is_some();
-    let has_lt = hash.get(Symbol::new("lt")).is_some();
-
-    if has_prefix {
+    if hash_get(&hash, "prefix").is_some() {
         return build_prefix_filter(schema, field, field_name, &hash);
     }
 
-    if has_gte || has_gt || has_lte || has_lt {
+    let has_range_key = ["gte", "gt", "lte", "lt"]
+        .iter()
+        .any(|k| hash_get(&hash, k).is_some());
+    if has_range_key {
         return build_range_filter(schema, field, field_name, &hash);
     }
 
@@ -266,6 +263,17 @@ fn build_hash_filter(
             field_name
         ),
     ))
+}
+
+/// Look up a Ruby hash value by key, accepting either a Symbol or a String key.
+///
+/// Ruby callers idiomatically mix the two:
+/// `{ :prefix => "x" }`, `{ "prefix" => "x" }`, and `{ prefix: "x" }` all feel
+/// equivalent. Rather than impose one convention, we try Symbol first (the more
+/// common Ruby style) and fall back to String.
+fn hash_get(hash: &RHash, key: &str) -> Option<Value> {
+    hash.get(Symbol::new(key))
+        .or_else(|| hash.get(RString::new(key).as_value()))
 }
 
 /// Build an exact-match `TermQuery` for a text field.
@@ -436,7 +444,7 @@ fn parse_date_bound(
     key: &str,
     field_name: &str,
 ) -> Result<Option<tantivy::DateTime>, Error> {
-    let Some(v) = hash.get(Symbol::new(key)) else {
+    let Some(v) = hash_get(hash, key) else {
         return Ok(None);
     };
     let s: String = magnus::TryConvert::try_convert(v).map_err(|_| {
@@ -499,9 +507,7 @@ fn build_prefix_filter(
     }
 
     // Invariant: build_hash_filter only dispatches here when :prefix is present.
-    let prefix_val = hash
-        .get(Symbol::new("prefix"))
-        .expect("build_prefix_filter requires :prefix key");
+    let prefix_val = hash_get(hash, "prefix").expect("build_prefix_filter requires :prefix key");
     let prefix: String = magnus::TryConvert::try_convert(prefix_val).map_err(|_| {
         Error::new(
             magnus::exception::arg_error(),

@@ -1,7 +1,7 @@
 [package]
 name = "tantivy_rb"
 # Keep in sync with lib/tantivy_rb/version.rb
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 publish = false
 description = "Ruby native extension wrapping the Tantivy full-text search engine via magnus/rb-sys"
