@@ -11,10 +11,11 @@
 //!
 //! Both modes support optional field-level term filters via the `filter:` hash.
 
-use crate::index::RbIndex;
+use crate::index::{parse_date, RbIndex};
 use magnus::{prelude::*, r_hash::ForEach, Error, RArray, RHash, RString, Ruby, Symbol, Value};
+use std::ops::Bound;
 use tantivy::collector::{Count, MultiCollector, TopDocs};
-use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, QueryParser, TermQuery};
+use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::{IndexRecordOption, OwnedValue, Schema};
 use tantivy::tokenizer::TokenStream;
 use tantivy::{DocAddress, Searcher, TantivyDocument};
@@ -180,14 +181,16 @@ fn build_full_query(
 ///
 /// Dispatches on the Ruby value type:
 /// - `Array` → OR-joined `TermQuery` clauses via a Should-BooleanQuery.
+/// - `Hash` with `:gte`/`:gt`/`:lte`/`:lt` keys → `RangeQuery` on a date field.
+/// - (Future commits) `Hash` with `:prefix` key → prefix query.
 /// - `String` → exact-match `TermQuery` on a text field.
-/// - (Future commits) `Hash` → range or prefix query.
 ///
-/// Returns `Ok(None)` when the entry is a no-op (e.g. empty array). The caller
-/// should skip — no clause is added to the outer BooleanQuery.
+/// Returns `Ok(None)` when the entry is a no-op (e.g. empty array, range with no
+/// bounds). The caller should skip — no clause is added to the outer
+/// BooleanQuery.
 ///
-/// Field-type validation (e.g. "text field only" for term filters) is performed
-/// inside this function using `schema.get_field_entry(field).field_type()`.
+/// Field-type validation (e.g. "text field only" for term filters, "date field
+/// only" for range filters) is performed inside this function.
 fn build_filter_clause(
     schema: &Schema,
     field_name: &str,
@@ -206,6 +209,11 @@ fn build_filter_clause(
         return build_array_filter(schema, field, field_name, arr);
     }
 
+    // Hash-valued filter → range or prefix query, dispatched on inner keys.
+    if let Ok(hash) = <RHash as magnus::TryConvert>::try_convert(value) {
+        return build_hash_filter(schema, field, field_name, hash);
+    }
+
     // String-valued filter → exact-match TermQuery (existing behaviour).
     if let Ok(s) = <String as magnus::TryConvert>::try_convert(value) {
         return build_term_filter(schema, field, field_name, &s).map(Some);
@@ -214,7 +222,40 @@ fn build_filter_clause(
     Err(Error::new(
         magnus::exception::arg_error(),
         format!(
-            "Unsupported filter value for field '{}': expected a String or Array",
+            "Unsupported filter value for field '{}': expected a String, Array, or Hash",
+            field_name
+        ),
+    ))
+}
+
+/// Dispatch a Hash-valued filter by inspecting its keys.
+///
+/// Accepted key sets:
+/// - Any of `:gte`, `:gt`, `:lte`, `:lt` → range query (date fields only).
+/// - `:prefix` → prefix query (future commit).
+///
+/// Unknown or empty key sets raise a descriptive error listing the accepted
+/// keys, so a typo like `{ "grt" => "..." }` fails fast rather than silently
+/// producing an empty result set.
+fn build_hash_filter(
+    schema: &Schema,
+    field: tantivy::schema::Field,
+    field_name: &str,
+    hash: RHash,
+) -> Result<Option<Box<dyn Query>>, Error> {
+    let has_gte = hash.get(Symbol::new("gte")).is_some();
+    let has_gt = hash.get(Symbol::new("gt")).is_some();
+    let has_lte = hash.get(Symbol::new("lte")).is_some();
+    let has_lt = hash.get(Symbol::new("lt")).is_some();
+
+    if has_gte || has_gt || has_lte || has_lt {
+        return build_range_filter(schema, field, field_name, &hash);
+    }
+
+    Err(Error::new(
+        magnus::exception::arg_error(),
+        format!(
+            "Unsupported filter hash for field '{}' — expected :gte, :gt, :lte, or :lt",
             field_name
         ),
     ))
@@ -293,6 +334,109 @@ fn build_array_filter(
     }
 
     Ok(Some(Box::new(BooleanQuery::new(term_clauses))))
+}
+
+/// Build a `RangeQuery` from a Hash with `:gte` / `:gt` / `:lte` / `:lt` keys.
+///
+/// Currently restricted to date fields — the only range-queryable field in the
+/// PatentSafe schema is `created_at`. Numeric range support can be added later
+/// when a caller arrives; the value-parsing surface (integer vs float vs date)
+/// is deliberately kept small for now.
+///
+/// Conflicting bound combinations (both `:gte` and `:gt`, or both `:lte` and
+/// `:lt`) are rejected: they're almost always a caller bug, and silently
+/// picking one would mask the mistake.
+///
+/// Range bounds use `Term::from_field_date_for_search`, which truncates the
+/// DateTime to the precision used at index time. The bare `Term::from_field_date`
+/// (used when adding documents) encodes at microsecond precision and does NOT
+/// match the indexed term at search time.
+fn build_range_filter(
+    schema: &Schema,
+    field: tantivy::schema::Field,
+    field_name: &str,
+    hash: &RHash,
+) -> Result<Option<Box<dyn Query>>, Error> {
+    let field_entry = schema.get_field_entry(field);
+    if !matches!(
+        field_entry.field_type(),
+        tantivy::schema::FieldType::Date(_)
+    ) {
+        return Err(Error::new(
+            magnus::exception::arg_error(),
+            format!(
+                "Range filter on field '{}' requires a date field",
+                field_name
+            ),
+        ));
+    }
+
+    let gte = hash_date_bound(hash, "gte", field_name)?;
+    let gt = hash_date_bound(hash, "gt", field_name)?;
+    let lte = hash_date_bound(hash, "lte", field_name)?;
+    let lt = hash_date_bound(hash, "lt", field_name)?;
+
+    if gte.is_some() && gt.is_some() {
+        return Err(Error::new(
+            magnus::exception::arg_error(),
+            format!(
+                "Range filter for field '{}' cannot specify both :gte and :gt",
+                field_name
+            ),
+        ));
+    }
+    if lte.is_some() && lt.is_some() {
+        return Err(Error::new(
+            magnus::exception::arg_error(),
+            format!(
+                "Range filter for field '{}' cannot specify both :lte and :lt",
+                field_name
+            ),
+        ));
+    }
+
+    let lower = match (gte, gt) {
+        (Some(v), None) => Bound::Included(tantivy::Term::from_field_date_for_search(field, v)),
+        (None, Some(v)) => Bound::Excluded(tantivy::Term::from_field_date_for_search(field, v)),
+        (None, None) => Bound::Unbounded,
+        (Some(_), Some(_)) => unreachable!("guarded above"),
+    };
+    let upper = match (lte, lt) {
+        (Some(v), None) => Bound::Included(tantivy::Term::from_field_date_for_search(field, v)),
+        (None, Some(v)) => Bound::Excluded(tantivy::Term::from_field_date_for_search(field, v)),
+        (None, None) => Bound::Unbounded,
+        (Some(_), Some(_)) => unreachable!("guarded above"),
+    };
+
+    if matches!(lower, Bound::Unbounded) && matches!(upper, Bound::Unbounded) {
+        return Ok(None);
+    }
+
+    Ok(Some(Box::new(RangeQuery::new(lower, upper))))
+}
+
+/// Read a date-valued bound from the hash under the given symbol key.
+///
+/// Returns `None` if the key is absent, `Some(DateTime)` if present and parseable,
+/// or an Error with field context if the value isn't a String or fails to parse.
+fn hash_date_bound(
+    hash: &RHash,
+    key: &str,
+    field_name: &str,
+) -> Result<Option<tantivy::DateTime>, Error> {
+    let Some(v) = hash.get(Symbol::new(key)) else {
+        return Ok(None);
+    };
+    let s: String = magnus::TryConvert::try_convert(v).map_err(|_| {
+        Error::new(
+            magnus::exception::arg_error(),
+            format!(
+                "Range filter for field '{}' expects a String for :{} bound",
+                field_name, key
+            ),
+        )
+    })?;
+    parse_date(&s).map(Some)
 }
 
 /// Execute the search query and collect scored documents + total count.
