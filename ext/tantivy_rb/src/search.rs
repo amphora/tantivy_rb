@@ -378,10 +378,10 @@ fn build_range_filter(
         ));
     }
 
-    let gte = hash_date_bound(hash, "gte", field_name)?;
-    let gt = hash_date_bound(hash, "gt", field_name)?;
-    let lte = hash_date_bound(hash, "lte", field_name)?;
-    let lt = hash_date_bound(hash, "lt", field_name)?;
+    let gte = parse_date_bound(hash, "gte", field_name)?;
+    let gt = parse_date_bound(hash, "gt", field_name)?;
+    let lte = parse_date_bound(hash, "lte", field_name)?;
+    let lt = parse_date_bound(hash, "lt", field_name)?;
 
     if gte.is_some() && gt.is_some() {
         return Err(Error::new(
@@ -415,9 +415,14 @@ fn build_range_filter(
         (Some(_), Some(_)) => unreachable!("guarded above"),
     };
 
-    if matches!(lower, Bound::Unbounded) && matches!(upper, Bound::Unbounded) {
-        return Ok(None);
-    }
+    // Unreachable: build_hash_filter only dispatches here when at least one of
+    // :gte/:gt/:lte/:lt is present, so one of the bounds above will be bounded.
+    // Kept as a defensive guard; a Bound::Unbounded pair would construct a
+    // match-everything RangeQuery that's both semantically wrong and expensive.
+    debug_assert!(
+        !matches!(lower, Bound::Unbounded) || !matches!(upper, Bound::Unbounded),
+        "build_range_filter called with no bounds — build_hash_filter dispatch is broken",
+    );
 
     Ok(Some(Box::new(RangeQuery::new(lower, upper))))
 }
@@ -426,7 +431,7 @@ fn build_range_filter(
 ///
 /// Returns `None` if the key is absent, `Some(DateTime)` if present and parseable,
 /// or an Error with field context if the value isn't a String or fails to parse.
-fn hash_date_bound(
+fn parse_date_bound(
     hash: &RHash,
     key: &str,
     field_name: &str,
@@ -493,7 +498,7 @@ fn build_prefix_filter(
         ));
     }
 
-    // Safe: build_hash_filter only calls us when :prefix is present.
+    // Invariant: build_hash_filter only dispatches here when :prefix is present.
     let prefix_val = hash
         .get(Symbol::new("prefix"))
         .expect("build_prefix_filter requires :prefix key");
@@ -535,6 +540,12 @@ fn build_prefix_filter(
 ///
 /// This matches the set used by `regex_syntax::escape_into`, so behaviour is
 /// predictable for callers familiar with Rust's `regex` crate.
+///
+/// `RegexQuery` in tantivy 0.24 compiles the pattern through `tantivy_fst::Regex`,
+/// which accepts a subset of `regex` syntax; the escape set above is a superset
+/// of what `tantivy_fst` treats as special, so all metachars are covered. If the
+/// tantivy / tantivy_fst version changes and introduces new metacharacters, this
+/// set must be re-verified.
 fn escape_prefix_to_regex(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
