@@ -68,7 +68,10 @@ fn is_removable_start(c: char, custom_chars: &[char]) -> bool {
         return custom_chars.contains(&c);
     }
     // Default leading strip characters (from Java BlockTokenParsingFilter)
-    matches!(c, '.' | ',' | ':' | ';' | '"' | ')' | '>' | '<' | '}' | ']' | '~' | '+')
+    matches!(
+        c,
+        '.' | ',' | ':' | ';' | '"' | ')' | '>' | '<' | '}' | ']' | '~' | '+'
+    )
 }
 
 /// Check if a character is removable from the end of a token.
@@ -81,7 +84,10 @@ fn is_removable_end(c: char, custom_chars: &[char]) -> bool {
         return custom_chars.contains(&c);
     }
     // Default trailing strip characters (from Java BlockTokenParsingFilter)
-    matches!(c, '.' | ',' | ':' | ';' | '"' | '(' | '<' | '>' | '[' | '{' | '%')
+    matches!(
+        c,
+        '.' | ',' | ':' | ';' | '"' | '(' | '<' | '>' | '[' | '{' | '%'
+    )
 }
 
 #[cfg(test)]
@@ -153,8 +159,14 @@ mod tests {
         let leading = vec!['.'];
         let trailing = vec!['.'];
         // Non-ASCII alphanumeric chars should not be stripped (they're alphanumeric)
-        assert_eq!(strip_punctuation(".caf\u{00E9}.", &leading, &trailing), "caf\u{00E9}");
-        assert_eq!(strip_punctuation("\u{00FC}ber", &leading, &trailing), "\u{00FC}ber");
+        assert_eq!(
+            strip_punctuation(".caf\u{00E9}.", &leading, &trailing),
+            "caf\u{00E9}"
+        );
+        assert_eq!(
+            strip_punctuation("\u{00FC}ber", &leading, &trailing),
+            "\u{00FC}ber"
+        );
     }
 
     #[test]

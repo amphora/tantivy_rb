@@ -335,10 +335,9 @@ impl RbIndex {
 /// 1. RFC 3339 with timezone — `"2024-01-15T10:30:00+00:00"`
 /// 2. ISO 8601 without timezone (assumed UTC) — `"2024-01-15T10:30:00"`
 /// 3. Date only (midnight UTC) — `"2024-01-15"`
-fn parse_date(s: &str) -> Result<DateTime, Error> {
-    let ts = parse_date_to_timestamp(s).map_err(|msg| {
-        Error::new(magnus::exception::arg_error(), msg)
-    })?;
+pub(crate) fn parse_date(s: &str) -> Result<DateTime, Error> {
+    let ts = parse_date_to_timestamp(s)
+        .map_err(|msg| Error::new(magnus::exception::arg_error(), msg))?;
     Ok(DateTime::from_timestamp_secs(ts))
 }
 
@@ -347,7 +346,7 @@ fn parse_date(s: &str) -> Result<DateTime, Error> {
 /// Returns a Unix timestamp (seconds since epoch) or an error message string.
 /// Extracted from `parse_date` so that `#[cfg(test)]` code can exercise the
 /// parsing branches without pulling Ruby symbols into the test binary.
-fn parse_date_to_timestamp(s: &str) -> Result<i64, String> {
+pub(crate) fn parse_date_to_timestamp(s: &str) -> Result<i64, String> {
     chrono::DateTime::parse_from_rfc3339(s)
         .or_else(|_| {
             chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")

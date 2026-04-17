@@ -117,12 +117,8 @@ fn register_index_tokenizer(index: &Index, name: &str, kwargs: &RHash) -> Result
     let stop_words_list = super::default::get_stop_words(kwargs)?;
     let stemmer_lang = super::default::get_stemmer_algorithm(kwargs)?;
 
-    let tokenizer = CompoundIndexTokenizer::new(
-        leading_strip,
-        trailing_strip,
-        stop_words_list,
-        stemmer_lang,
-    );
+    let tokenizer =
+        CompoundIndexTokenizer::new(leading_strip, trailing_strip, stop_words_list, stemmer_lang);
 
     index.tokenizers().register(name, tokenizer);
     Ok(())

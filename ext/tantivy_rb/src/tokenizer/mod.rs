@@ -29,12 +29,15 @@ pub fn register_tokenizer(index: &Index, name: String, kwargs: RHash) -> Result<
         })
         .and_then(|v| magnus::TryConvert::try_convert(v))?;
 
-    let type_name: String = type_sym.name().map_err(|e| {
-        Error::new(
-            magnus::exception::runtime_error(),
-            format!("Failed to get symbol name: {}", e),
-        )
-    })?.to_string();
+    let type_name: String = type_sym
+        .name()
+        .map_err(|e| {
+            Error::new(
+                magnus::exception::runtime_error(),
+                format!("Failed to get symbol name: {}", e),
+            )
+        })?
+        .to_string();
 
     match type_name.as_str() {
         "default" => default::register(index, &name, &kwargs),

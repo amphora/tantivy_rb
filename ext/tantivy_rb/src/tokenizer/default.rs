@@ -63,9 +63,10 @@ fn parse_stemmer_option(kwargs: &RHash) -> Result<(Language, Algorithm), Error> 
     match kwargs.get(Symbol::new("stemmer")) {
         Some(val) => {
             let sym: Symbol = magnus::TryConvert::try_convert(val)?;
-            let name = sym.name().map_err(|e| {
-                Error::new(magnus::exception::runtime_error(), format!("{}", e))
-            })?.to_string();
+            let name = sym
+                .name()
+                .map_err(|e| Error::new(magnus::exception::runtime_error(), format!("{}", e)))?
+                .to_string();
             let lower = name.to_lowercase();
             LANGUAGE_TABLE
                 .iter()
@@ -102,9 +103,10 @@ pub fn get_stop_words(kwargs: &RHash) -> Result<Vec<String>, Error> {
         Some(val) => {
             // Try as symbol first (language name)
             if let Ok(sym) = <Symbol as magnus::TryConvert>::try_convert(val) {
-                let name = sym.name().map_err(|e| {
-                    Error::new(magnus::exception::runtime_error(), format!("{}", e))
-                })?.to_string();
+                let name = sym
+                    .name()
+                    .map_err(|e| Error::new(magnus::exception::runtime_error(), format!("{}", e)))?
+                    .to_string();
                 match name.to_lowercase().as_str() {
                     "english" => Ok(english_stop_words().to_vec()),
                     _ => Err(Error::new(
@@ -153,7 +155,12 @@ mod tests {
     #[test]
     fn test_english_stop_words_count() {
         let words = english_stop_words();
-        assert_eq!(words.len(), 33, "Expected 33 English stop words, got {}", words.len());
+        assert_eq!(
+            words.len(),
+            33,
+            "Expected 33 English stop words, got {}",
+            words.len()
+        );
     }
 
     #[test]
