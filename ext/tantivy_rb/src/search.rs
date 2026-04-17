@@ -12,7 +12,7 @@
 //! Both modes support optional field-level term filters via the `filter:` hash.
 
 use crate::index::RbIndex;
-use magnus::{prelude::*, r_hash::ForEach, Error, Ruby, RArray, RHash, RString, Symbol, Value};
+use magnus::{prelude::*, r_hash::ForEach, Error, RArray, RHash, RString, Ruby, Symbol, Value};
 use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, PhraseQuery, Query, QueryParser, TermQuery};
 use tantivy::schema::{IndexRecordOption, OwnedValue, Schema};
@@ -70,8 +70,7 @@ fn parse_search_args(ruby_args: &[Value]) -> Result<SearchArgs, Error> {
                 offset = magnus::TryConvert::try_convert(offset_val)?;
             }
             if let Some(qt_val) = kwargs.get(Symbol::new("query_tokenizer")) {
-                query_tokenizer_name =
-                    Some(magnus::TryConvert::try_convert(qt_val)?);
+                query_tokenizer_name = Some(magnus::TryConvert::try_convert(qt_val)?);
             }
         }
     }
@@ -131,8 +130,7 @@ pub fn execute_search(rb_index: &RbIndex, ruby_args: &[Value]) -> Result<RHash, 
     let fields = resolve_fields(rb_index.schema(), &args.field_names)?;
     let query = build_full_query(rb_index, &args, &fields)?;
     let searcher = rb_index.reader().searcher();
-    let (scored_docs, total) =
-        collect_search_results(&searcher, &*query, args.limit, args.offset)?;
+    let (scored_docs, total) = collect_search_results(&searcher, &*query, args.limit, args.offset)?;
     marshal_results(rb_index.schema(), &searcher, &scored_docs, total)
 }
 
@@ -377,9 +375,7 @@ fn build_tokenized_query(
 
     for segment in &segments {
         let maybe_query = match segment {
-            QuerySegment::Terms(text) => {
-                build_terms_query(rb_index, text, tokenizer_name, fields)?
-            }
+            QuerySegment::Terms(text) => build_terms_query(rb_index, text, tokenizer_name, fields)?,
             QuerySegment::Phrase(text) => {
                 build_phrase_query(rb_index, text, tokenizer_name, fields)?
             }
@@ -428,7 +424,9 @@ fn build_phrase_query(
     while token_stream.advance() {
         let tok = token_stream.token();
         // Take only the first token at each position (stemmed form).
-        position_terms.entry(tok.position).or_insert_with(|| tok.text.clone());
+        position_terms
+            .entry(tok.position)
+            .or_insert_with(|| tok.text.clone());
     }
 
     if position_terms.is_empty() {
@@ -461,10 +459,7 @@ fn build_phrase_query(
             .iter()
             .map(|text| tantivy::Term::from_field_text(field, text))
             .collect();
-        field_clauses.push((
-            Occur::Should,
-            Box::new(PhraseQuery::new(terms)),
-        ));
+        field_clauses.push((Occur::Should, Box::new(PhraseQuery::new(terms))));
     }
 
     Ok(Some(Box::new(BooleanQuery::new(field_clauses))))
@@ -547,12 +542,10 @@ fn build_terms_query(
 fn owned_value_to_ruby(val: &OwnedValue, ruby: &Ruby) -> Result<Value, Error> {
     Ok(match val {
         OwnedValue::Str(s) => RString::new(s).as_value(),
-        OwnedValue::U64(n) => {
-            match i64::try_from(*n) {
-                Ok(i) => ruby.integer_from_i64(i).as_value(),
-                Err(_) => RString::new(&n.to_string()).as_value(),
-            }
-        }
+        OwnedValue::U64(n) => match i64::try_from(*n) {
+            Ok(i) => ruby.integer_from_i64(i).as_value(),
+            Err(_) => RString::new(&n.to_string()).as_value(),
+        },
         OwnedValue::I64(n) => ruby.integer_from_i64(*n).as_value(),
         OwnedValue::F64(n) => ruby.float_from_f64(*n).as_value(),
         OwnedValue::Date(dt) => {
@@ -589,35 +582,47 @@ mod tests {
     #[test]
     fn test_phrase_with_trailing_terms() {
         let segments = parse_query_segments("\"exact phrase\" other terms");
-        assert_eq!(segments, vec![
-            QuerySegment::Phrase("exact phrase".into()),
-            QuerySegment::Terms(" other terms".into()),
-        ]);
+        assert_eq!(
+            segments,
+            vec![
+                QuerySegment::Phrase("exact phrase".into()),
+                QuerySegment::Terms(" other terms".into()),
+            ]
+        );
     }
 
     #[test]
     fn test_phrase_with_leading_terms() {
         let segments = parse_query_segments("other terms \"exact phrase\"");
-        assert_eq!(segments, vec![
-            QuerySegment::Terms("other terms ".into()),
-            QuerySegment::Phrase("exact phrase".into()),
-        ]);
+        assert_eq!(
+            segments,
+            vec![
+                QuerySegment::Terms("other terms ".into()),
+                QuerySegment::Phrase("exact phrase".into()),
+            ]
+        );
     }
 
     #[test]
     fn test_mixed_phrases_and_terms() {
         let segments = parse_query_segments("\"phrase one\" middle \"phrase two\"");
-        assert_eq!(segments, vec![
-            QuerySegment::Phrase("phrase one".into()),
-            QuerySegment::Terms(" middle ".into()),
-            QuerySegment::Phrase("phrase two".into()),
-        ]);
+        assert_eq!(
+            segments,
+            vec![
+                QuerySegment::Phrase("phrase one".into()),
+                QuerySegment::Terms(" middle ".into()),
+                QuerySegment::Phrase("phrase two".into()),
+            ]
+        );
     }
 
     #[test]
     fn test_unmatched_quote_treated_as_terms() {
         let segments = parse_query_segments("\"unmatched quote");
-        assert_eq!(segments, vec![QuerySegment::Terms("unmatched quote".into())]);
+        assert_eq!(
+            segments,
+            vec![QuerySegment::Terms("unmatched quote".into())]
+        );
     }
 
     #[test]
@@ -635,20 +640,24 @@ mod tests {
     #[test]
     fn test_multiple_phrases_no_terms() {
         let segments = parse_query_segments("\"first phrase\" \"second phrase\"");
-        assert_eq!(segments, vec![
-            QuerySegment::Phrase("first phrase".into()),
-            QuerySegment::Phrase("second phrase".into()),
-        ]);
+        assert_eq!(
+            segments,
+            vec![
+                QuerySegment::Phrase("first phrase".into()),
+                QuerySegment::Phrase("second phrase".into()),
+            ]
+        );
     }
 
     #[test]
     fn test_real_world_query() {
-        let segments = parse_query_segments(
-            "\"Cryptographic Controls and Key Management Policy\""
+        let segments = parse_query_segments("\"Cryptographic Controls and Key Management Policy\"");
+        assert_eq!(
+            segments,
+            vec![QuerySegment::Phrase(
+                "Cryptographic Controls and Key Management Policy".into()
+            ),]
         );
-        assert_eq!(segments, vec![
-            QuerySegment::Phrase("Cryptographic Controls and Key Management Policy".into()),
-        ]);
     }
 
     // TODO:: [DEFERRED] Add Ruby-dependent unit tests (requires magnus::embed or Ruby linking)

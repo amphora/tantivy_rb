@@ -187,7 +187,10 @@ fn hash_get_string(hash: &RHash, key: &str) -> Result<Option<String>, Error> {
 ///
 /// All numeric `add_*_field` methods accept `(name, opts = {})` where opts
 /// can contain `:stored`, `:indexed`, and `:fast`. Returns the parsed tuple.
-fn parse_numeric_args(args: &[Value], method_name: &str) -> Result<(String, bool, bool, bool), Error> {
+fn parse_numeric_args(
+    args: &[Value],
+    method_name: &str,
+) -> Result<(String, bool, bool, bool), Error> {
     if args.is_empty() {
         return Err(Error::new(
             magnus::exception::arg_error(),

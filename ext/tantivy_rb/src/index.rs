@@ -336,9 +336,8 @@ impl RbIndex {
 /// 2. ISO 8601 without timezone (assumed UTC) — `"2024-01-15T10:30:00"`
 /// 3. Date only (midnight UTC) — `"2024-01-15"`
 fn parse_date(s: &str) -> Result<DateTime, Error> {
-    let ts = parse_date_to_timestamp(s).map_err(|msg| {
-        Error::new(magnus::exception::arg_error(), msg)
-    })?;
+    let ts = parse_date_to_timestamp(s)
+        .map_err(|msg| Error::new(magnus::exception::arg_error(), msg))?;
     Ok(DateTime::from_timestamp_secs(ts))
 }
 
