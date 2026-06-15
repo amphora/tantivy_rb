@@ -224,6 +224,19 @@ prefix query, `te?t` → `te.t` a single-char wildcard, and `*tion` → `.*tion`
 dropped rather than executed as a match-all. Wildcards inside a quoted phrase are
 **not** expanded — they stay literal, matching Lucene's phrase behaviour.
 
+### Auto-prefix on the last term (AMPHTT-849)
+
+The **last unquoted term** of a content query is automatically treated as a
+prefix, so `pen` matches `pen` *and* `penetration`/`pending` ("search-as-you-type")
+without the user typing `*`. The query builder ORs a `base.*` `RegexQuery` onto
+the trailing term's clauses (`pen` → `pen OR pen.*`) — exact/stem hits still match
+both clauses and keep their BM25 boost. Only the trailing term is prefixed
+(`penetration test` prefixes only `test`); a trailing quoted phrase
+(`foo "bar baz"`) is left exact; an explicit wildcard (`pen*`) is not
+double-prefixed; and terms shorter than the minimum prefix length are left as
+exact matches. This is a UX improvement beyond Java parity (Java requires an
+explicit `*`).
+
 ### Example walkthrough
 
 Input: `"~0.4 mg/mL in 25:75 methanol:water; prepared E21634-016"`
