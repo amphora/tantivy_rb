@@ -792,19 +792,29 @@ fn build_tokenized_query(
     let segments = parse_query_segments(query_string);
 
     // Fast path: no quotes found — single Terms segment, use existing logic.
+    // It is the final segment, so its trailing term is auto-prefix eligible.
     if segments.len() == 1 {
         if let QuerySegment::Terms(ref text) = segments[0] {
-            return Ok(build_terms_query(rb_index, text, tokenizer_name, fields)?
-                .unwrap_or_else(|| Box::new(tantivy::query::EmptyQuery)));
+            return Ok(
+                build_terms_query(rb_index, text, tokenizer_name, fields, true)?
+                    .unwrap_or_else(|| Box::new(tantivy::query::EmptyQuery)),
+            );
         }
     }
 
     // Build a clause for each segment and AND them together.
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
-    for segment in &segments {
+    // AMPHTT-849: only the query's trailing term auto-prefixes, and only when
+    // the final segment is unquoted terms — a trailing quoted phrase stays
+    // exact. So a Terms segment is auto-prefix eligible iff it is the last
+    // segment of the query.
+    let last_index = segments.len() - 1;
+    for (i, segment) in segments.iter().enumerate() {
         let maybe_query = match segment {
-            QuerySegment::Terms(text) => build_terms_query(rb_index, text, tokenizer_name, fields)?,
+            QuerySegment::Terms(text) => {
+                build_terms_query(rb_index, text, tokenizer_name, fields, i == last_index)?
+            }
             QuerySegment::Phrase(text) => {
                 build_phrase_query(rb_index, text, tokenizer_name, fields)?
             }
@@ -908,10 +918,24 @@ fn build_terms_query(
     query_string: &str,
     tokenizer_name: &str,
     fields: &[tantivy::schema::Field],
+    auto_prefix_last: bool,
 ) -> Result<Option<Box<dyn Query>>, Error> {
-    build_terms_query_core(rb_index.index(), query_string, tokenizer_name, fields)
-        .map_err(|msg| Error::new(magnus::exception::arg_error(), msg))
+    build_terms_query_core(
+        rb_index.index(),
+        query_string,
+        tokenizer_name,
+        fields,
+        auto_prefix_last,
+    )
+    .map_err(|msg| Error::new(magnus::exception::arg_error(), msg))
 }
+
+/// Minimum length (in characters) of the prefix base before AMPHTT-849
+/// auto-prefix kicks in. Short prefixes (`a*`, `x*`) scan most of the term
+/// dictionary for little value, so a 1-char trailing term is left as an exact
+/// match. Explicit wildcards (AMPHTT-847) have no such floor — the user asked
+/// for them. Single tunable knob.
+const MIN_AUTOPREFIX_PREFIX_LEN: usize = 2;
 
 /// Ruby-independent core of `build_terms_query`.
 ///
@@ -925,11 +949,18 @@ fn build_terms_query(
 /// `RegexQuery` instead of a `TermQuery`; a pure-wildcard token (no literal
 /// character) contributes no clause. If that empties a group it is dropped, and
 /// if every group is dropped the function returns `None`.
+///
+/// AMPHTT-849: when `auto_prefix_last` is set, the **last** position group also
+/// gets a `base.*` prefix `RegexQuery` OR'd alongside its term clauses — so a
+/// trailing `pen` matches `pen` AND `penetration`/`pending` ("search-as-you-type").
+/// Skipped when that term is already an explicit wildcard (847 handles it) or is
+/// shorter than `MIN_AUTOPREFIX_PREFIX_LEN`.
 fn build_terms_query_core(
     index: &tantivy::Index,
     query_string: &str,
     tokenizer_name: &str,
     fields: &[tantivy::schema::Field],
+    auto_prefix_last: bool,
 ) -> Result<Option<Box<dyn Query>>, String> {
     let tokenizer_manager = index.tokenizers();
     let mut tokenizer = tokenizer_manager
@@ -960,7 +991,8 @@ fn build_terms_query_core(
     // All synonyms at the same position are OR'd across all fields.
     // Different positions are AND'd together.
     let mut position_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-    for synonyms in position_groups.values() {
+    let group_count = position_groups.len();
+    for (group_index, synonyms) in position_groups.values().enumerate() {
         let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for token_text in synonyms {
             if is_wildcard_token(token_text) {
@@ -984,6 +1016,33 @@ fn build_terms_query_core(
                 }
             }
         }
+
+        // AMPHTT-849: auto-prefix the query's trailing term. OR a `base.*`
+        // prefix clause into the last group's field_clauses, so exact/stem hits
+        // (which match both clauses) keep their BM25 boost while prefix matches
+        // are included and rank lower. The base is the token's original
+        // (unstemmed) form — synonyms.last() — so we prefix what the user typed,
+        // not its stem. Skipped for explicit wildcards (already handled above)
+        // and for prefixes below the length floor.
+        let is_last_group = group_index + 1 == group_count;
+        if auto_prefix_last && is_last_group {
+            if let Some(base) = synonyms.last() {
+                let any_wildcard = synonyms.iter().any(|s| is_wildcard_token(s));
+                if !any_wildcard && base.chars().count() >= MIN_AUTOPREFIX_PREFIX_LEN {
+                    let pattern = format!("{}.*", escape_prefix_to_regex(base));
+                    for &field in fields {
+                        let query = RegexQuery::from_pattern(&pattern, field).map_err(|e| {
+                            format!(
+                                "Failed to build auto-prefix RegexQuery '{}': {}",
+                                pattern, e
+                            )
+                        })?;
+                        field_clauses.push((Occur::Should, Box::new(query)));
+                    }
+                }
+            }
+        }
+
         // A group with no clauses (e.g. a lone pure-wildcard token) is dropped
         // so it doesn't AND an always-false / match-all clause into the query.
         if !field_clauses.is_empty() {
@@ -1233,8 +1292,13 @@ mod tests {
         writer.commit().unwrap();
     }
 
-    fn count_hits(index: &tantivy::Index, content: tantivy::schema::Field, query: &str) -> usize {
-        let query = build_terms_query_core(index, query, "ps_query", &[content])
+    fn count_hits(
+        index: &tantivy::Index,
+        content: tantivy::schema::Field,
+        query: &str,
+        auto_prefix: bool,
+    ) -> usize {
+        let query = build_terms_query_core(index, query, "ps_query", &[content], auto_prefix)
             .unwrap()
             .expect("expected a non-empty query");
         let searcher = index.reader().unwrap().searcher();
@@ -1252,7 +1316,7 @@ mod tests {
             &["penetration testing", "pending review", "apple pie"],
         );
         // pen* → pen.* matches penetration + pending, not apple.
-        assert_eq!(count_hits(&index, content, "pen*"), 2);
+        assert_eq!(count_hits(&index, content, "pen*", false), 2);
     }
 
     #[test]
@@ -1260,7 +1324,7 @@ mod tests {
         let (index, content) = build_test_index();
         index_docs(&index, content, &["unit test", "plain text", "many tests"]);
         // te?t → te.t matches the 4-char "test" and "text", not 5-char "tests".
-        assert_eq!(count_hits(&index, content, "te?t"), 2);
+        assert_eq!(count_hits(&index, content, "te?t", false), 2);
     }
 
     #[test]
@@ -1272,7 +1336,7 @@ mod tests {
             &["a long section", "deep penetration", "apple"],
         );
         // *tion → .*tion matches section + penetration.
-        assert_eq!(count_hits(&index, content, "*tion"), 2);
+        assert_eq!(count_hits(&index, content, "*tion", false), 2);
     }
 
     #[test]
@@ -1284,7 +1348,7 @@ mod tests {
             &["penetration document", "penetration apple"],
         );
         // pen* doc* requires both (AND default operator).
-        assert_eq!(count_hits(&index, content, "pen* doc*"), 1);
+        assert_eq!(count_hits(&index, content, "pen* doc*", false), 1);
     }
 
     #[test]
@@ -1292,8 +1356,68 @@ mod tests {
         let (index, content) = build_test_index();
         index_docs(&index, content, &["anything at all"]);
         // ** has no literal char → no clause → no query (never a match-all).
-        let query = build_terms_query_core(&index, "**", "ps_query", &[content]).unwrap();
+        let query = build_terms_query_core(&index, "**", "ps_query", &[content], false).unwrap();
         assert!(query.is_none());
+    }
+
+    // ── AMPHTT-849: auto-prefix on the last query term ─────────────────────
+
+    #[test]
+    fn test_autoprefix_closes_stem_gap() {
+        let (index, content) = build_test_index();
+        index_docs(
+            &index,
+            content,
+            &["penetration testing", "pending review", "apple pie"],
+        );
+        // Without auto-prefix, bare "pen" matches no indexed term (the index has
+        // stems "penetr"/"pend", never "pen"). With auto-prefix, pen.* matches
+        // penetration + pending. This is the reported pen=6 / Penetration=31 gap.
+        assert_eq!(count_hits(&index, content, "pen", false), 0);
+        assert_eq!(count_hits(&index, content, "pen", true), 2);
+    }
+
+    #[test]
+    fn test_autoprefix_only_last_term() {
+        let (index, content) = build_test_index();
+        index_docs(&index, content, &["form tester", "formula test"]);
+        // "form test": only the trailing "test" is prefixed (test.* matches
+        // "tester"). "form" stays exact, so "formula" (stem "formula", no "form"
+        // term) is NOT matched — proving the leading term is not prefixed.
+        assert_eq!(count_hits(&index, content, "form test", true), 1);
+    }
+
+    #[test]
+    fn test_autoprefix_skips_explicit_wildcard() {
+        let (index, content) = build_test_index();
+        index_docs(
+            &index,
+            content,
+            &["penetration testing", "pending review", "apple pie"],
+        );
+        // An explicit trailing wildcard is handled by the 847 path; auto-prefix
+        // must not double-prefix it. Same result with the flag on or off.
+        assert_eq!(count_hits(&index, content, "pen*", true), 2);
+        assert_eq!(count_hits(&index, content, "pen*", false), 2);
+    }
+
+    #[test]
+    fn test_autoprefix_min_length_guard() {
+        let (index, content) = build_test_index();
+        index_docs(&index, content, &["xenon gas"]);
+        // 1-char "x" is below the floor → no x.* prefix → exact "x" matches
+        // nothing. 2-char "xe" clears the floor → xe.* matches "xenon".
+        assert_eq!(count_hits(&index, content, "x", true), 0);
+        assert_eq!(count_hits(&index, content, "xe", true), 1);
+    }
+
+    #[test]
+    fn test_autoprefix_disabled_flag() {
+        let (index, content) = build_test_index();
+        index_docs(&index, content, &["penetration testing"]);
+        // The flag gates the behaviour — this is the path build_tokenized_query
+        // uses for a query whose final segment is a quoted phrase.
+        assert_eq!(count_hits(&index, content, "pen", false), 0);
     }
 
     // TODO:: [DEFERRED] Add Ruby-dependent unit tests (requires magnus::embed or Ruby linking)
