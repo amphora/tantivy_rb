@@ -129,7 +129,24 @@ impl<'a> CompoundQueryTokenStream<'a> {
                 continue;
             }
 
-            // Step 6: Stemming — emit stemmed form, plus original if different.
+            self.global_position += 1;
+
+            // Step 6a: Wildcard tokens (containing * or ?) bypass the stemmer.
+            // Lucene's StandardQueryParser does not analyse wildcard terms —
+            // they match raw indexed terms. Stemming `running*` would corrupt
+            // it to `run*`, silently changing what the user typed. Emit a
+            // single, unstemmed form (no dual-emission — there is no
+            // stem/original pair to OR). See AMPHTT-847.
+            if is_wildcard_token(&lowered) {
+                let mut tok = Token::default();
+                tok.text = lowered;
+                tok.position = self.global_position;
+                self.buffer.push(tok);
+                self.buf_pos = 0;
+                return true;
+            }
+
+            // Step 6b: Stemming — emit stemmed form, plus original if different.
             // Matches Java PatentSafeQueryAnalyser which emits both forms.
             // Both forms are emitted at the SAME position so that
             // build_tokenized_query treats them as synonyms (OR), matching
@@ -138,7 +155,6 @@ impl<'a> CompoundQueryTokenStream<'a> {
             // the unstemmed original CAN match in the index, giving BM25
             // a boost for exact-match documents.
             let stemmed = self.stemmer.stem(&lowered).to_string();
-            self.global_position += 1;
             let mut tok = Token::default();
             tok.text = stemmed.clone();
             tok.position = self.global_position;
@@ -177,6 +193,17 @@ fn is_query_filtered_char(c: char) -> bool {
         return false;
     }
     !matches!(c, '?' | '*' | '"')
+}
+
+/// True if a token carries an explicit wildcard character (`*` or `?`).
+///
+/// Wildcard tokens bypass stemming here (so the user's literal prefix/pattern
+/// is preserved — Lucene does not analyse wildcard terms) and are turned into
+/// `RegexQuery` clauses by the search layer. Shared with `crate::search` so the
+/// tokenizer and the query builder agree on what counts as a wildcard.
+/// See AMPHTT-847.
+pub(crate) fn is_wildcard_token(token: &str) -> bool {
+    token.contains('*') || token.contains('?')
 }
 
 #[cfg(test)]
