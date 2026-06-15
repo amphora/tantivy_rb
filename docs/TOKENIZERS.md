@@ -237,6 +237,31 @@ double-prefixed; and terms shorter than the minimum prefix length are left as
 exact matches. This is a UX improvement beyond Java parity (Java requires an
 explicit `*`).
 
+### Power query — raw search syntax (AMPHTT-848)
+
+The content path above strips operators; **power query** (`power_query: true` on
+`Index#search`) passes input unescaped to Tantivy's standalone query grammar
+(`tantivy-query-grammar`), then lowers the parsed AST to a query ourselves. This
+ports Java's `makePowerQuery` and supports:
+
+- boolean `AND` / `OR` / `NOT`, `+` / `-`, and grouping `( )` — **AND is the default** operator
+- field scoping: `label:kinase`, `summary:"exact phrase"`
+- ranges: `created_at:[2020-01-01 TO 2020-12-31]` (date and lexical text bounds)
+- set membership: `state:IN [active deleted]`
+- bare-term wildcards `pen*` / `te?t` and phrase-prefix `"big bad wo"*`
+
+Term leaves are analysed through the **same `ps_query` tokenizer** as content
+search (so stemming/synonyms/wildcards behave identically) — the lowering reuses
+`build_terms_query_core` / `build_phrase_query_core` per leaf. Stock Tantivy
+`QueryParser` is *not* used, because it cannot do bare-term wildcards (`pen*`
+errors there); owning the lowering is what lets power query combine boolean
+syntax with `847` wildcards, e.g. `title:pen* OR summary:report`.
+
+Two intentional divergences from Lucene:
+
+- **`field:*` (exists)** is rejected — Tantivy's `ExistsQuery` needs a fast/columnar field, which our text fields are not.
+- **Only-negative queries** (`NOT apple`) return the *complement* ("everything except apple") rather than erroring as Lucene's strict parser does.
+
 ### Example walkthrough
 
 Input: `"~0.4 mg/mL in 25:75 methanol:water; prepared E21634-016"`
