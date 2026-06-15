@@ -12,6 +12,7 @@
 //! Both modes support optional field-level term filters via the `filter:` hash.
 
 use crate::index::{parse_date, RbIndex};
+use crate::tokenizer::compound::query::is_wildcard_token;
 use magnus::{prelude::*, r_hash::ForEach, Error, RArray, RHash, RString, Ruby, Symbol, Value};
 use std::ops::Bound;
 use tantivy::collector::{Count, MultiCollector, TopDocs};
@@ -555,31 +556,72 @@ fn build_prefix_filter(
 fn escape_prefix_to_regex(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(
-            c,
-            '\\' | '.'
-                | '+'
-                | '*'
-                | '?'
-                | '('
-                | ')'
-                | '|'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | '^'
-                | '$'
-                | '#'
-                | '&'
-                | '-'
-                | '~'
-        ) {
+        if is_regex_metachar(c) {
             out.push('\\');
         }
         out.push(c);
     }
     out
+}
+
+/// True for characters that must be backslash-escaped to match literally in a
+/// `tantivy_fst` regex. The set matches `regex_syntax::escape_into`, so it is a
+/// superset of what `tantivy_fst` treats as special. Shared by
+/// `escape_prefix_to_regex` and `wildcard_to_regex` so they escape identically.
+fn is_regex_metachar(c: char) -> bool {
+    matches!(
+        c,
+        '\\' | '.'
+            | '+'
+            | '*'
+            | '?'
+            | '('
+            | ')'
+            | '|'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '^'
+            | '$'
+            | '#'
+            | '&'
+            | '-'
+            | '~'
+    )
+}
+
+/// Translate a query token carrying `*`/`?` wildcards into a `tantivy_fst`
+/// regex pattern: `*` → `.*`, `?` → `.`, every other character escaped to match
+/// literally (same metachar set as `escape_prefix_to_regex`).
+///
+/// `RegexQuery` is implicitly whole-token-anchored, so the single output covers
+/// both of Lucene's wildcard query types: `pen*` → `pen.*` is a `PrefixQuery`,
+/// `te?t` → `te.t` is a `WildcardQuery`, and `*tion` → `.*tion` is a (slow but
+/// supported) leading wildcard. See AMPHTT-847.
+///
+/// Returns `None` for a token with no literal (non-wildcard) character — `*`,
+/// `**`, `*?` — which would compile to a match-everything `.*`/`.`: semantically
+/// meaningless and an expensive full-dictionary scan. The caller drops these
+/// rather than executing them.
+fn wildcard_to_regex(token: &str) -> Option<String> {
+    if !token.chars().any(|c| c != '*' && c != '?') {
+        return None;
+    }
+    let mut out = String::with_capacity(token.len() + 2);
+    for c in token.chars() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            other => {
+                if is_regex_metachar(other) {
+                    out.push('\\');
+                }
+                out.push(other);
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Execute the search query and collect scored documents + total count.
@@ -867,13 +909,32 @@ fn build_terms_query(
     tokenizer_name: &str,
     fields: &[tantivy::schema::Field],
 ) -> Result<Option<Box<dyn Query>>, Error> {
-    let tokenizer_manager = rb_index.index().tokenizers();
-    let mut tokenizer = tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
-        Error::new(
-            magnus::exception::arg_error(),
-            format!("Unknown query tokenizer: '{}'", tokenizer_name),
-        )
-    })?;
+    build_terms_query_core(rb_index.index(), query_string, tokenizer_name, fields)
+        .map_err(|msg| Error::new(magnus::exception::arg_error(), msg))
+}
+
+/// Ruby-independent core of `build_terms_query`.
+///
+/// Takes a plain `&tantivy::Index` and returns plain-`String` errors, so it can
+/// be unit-tested against an in-RAM index without the Magnus/Ruby linkage that
+/// makes the `RbIndex`-based wrapper untestable (see AMPHTT-847; the remaining
+/// Ruby-dependent functions are tracked by the AMPHTT-1172 spike).
+///
+/// Each position group becomes a `Must` clause; tokens within a group are OR'd
+/// (`Should`) across all fields. A token carrying a wildcard (`*`/`?`) builds a
+/// `RegexQuery` instead of a `TermQuery`; a pure-wildcard token (no literal
+/// character) contributes no clause. If that empties a group it is dropped, and
+/// if every group is dropped the function returns `None`.
+fn build_terms_query_core(
+    index: &tantivy::Index,
+    query_string: &str,
+    tokenizer_name: &str,
+    fields: &[tantivy::schema::Field],
+) -> Result<Option<Box<dyn Query>>, String> {
+    let tokenizer_manager = index.tokenizers();
+    let mut tokenizer = tokenizer_manager
+        .get(tokenizer_name)
+        .ok_or_else(|| format!("Unknown query tokenizer: '{}'", tokenizer_name))?;
 
     // Collect tokens with their positions so we can group synonyms.
     let mut token_stream = tokenizer.token_stream(query_string);
@@ -895,22 +956,43 @@ fn build_terms_query(
         position_groups.entry(pos).or_default().push(text);
     }
 
-    // For each position group, create: Must(synonym1_in_field1 OR synonym1_in_field2 OR synonym2_in_field1 ...)
+    // For each position group, create: Must(synonym1_in_field1 OR synonym1_in_field2 OR ...)
     // All synonyms at the same position are OR'd across all fields.
     // Different positions are AND'd together.
     let mut position_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     for synonyms in position_groups.values() {
         let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         for token_text in synonyms {
-            for &field in fields {
-                let term = tantivy::Term::from_field_text(field, token_text);
-                field_clauses.push((
-                    Occur::Should,
-                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
-                ));
+            if is_wildcard_token(token_text) {
+                // Wildcard token → one RegexQuery per field. A pure-wildcard
+                // token (`**`) yields None and contributes no clause.
+                if let Some(pattern) = wildcard_to_regex(token_text) {
+                    for &field in fields {
+                        let query = RegexQuery::from_pattern(&pattern, field).map_err(|e| {
+                            format!("Failed to build wildcard RegexQuery '{}': {}", pattern, e)
+                        })?;
+                        field_clauses.push((Occur::Should, Box::new(query)));
+                    }
+                }
+            } else {
+                for &field in fields {
+                    let term = tantivy::Term::from_field_text(field, token_text);
+                    field_clauses.push((
+                        Occur::Should,
+                        Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+                    ));
+                }
             }
         }
-        position_clauses.push((Occur::Must, Box::new(BooleanQuery::new(field_clauses))));
+        // A group with no clauses (e.g. a lone pure-wildcard token) is dropped
+        // so it doesn't AND an always-false / match-all clause into the query.
+        if !field_clauses.is_empty() {
+            position_clauses.push((Occur::Must, Box::new(BooleanQuery::new(field_clauses))));
+        }
+    }
+
+    if position_clauses.is_empty() {
+        return Ok(None);
     }
 
     Ok(Some(Box::new(BooleanQuery::new(position_clauses))))
@@ -1090,13 +1172,140 @@ mod tests {
         assert_eq!(escape_prefix_to_regex("中文"), "中文");
     }
 
+    // ── AMPHTT-847: wildcard_to_regex translation ──────────────────────────
+
+    #[test]
+    fn test_wildcard_to_regex_prefix() {
+        assert_eq!(wildcard_to_regex("pen*").as_deref(), Some("pen.*"));
+    }
+
+    #[test]
+    fn test_wildcard_to_regex_question() {
+        assert_eq!(wildcard_to_regex("te?t").as_deref(), Some("te.t"));
+    }
+
+    #[test]
+    fn test_wildcard_to_regex_leading_and_mid() {
+        assert_eq!(wildcard_to_regex("*tion").as_deref(), Some(".*tion"));
+        assert_eq!(wildcard_to_regex("p*n").as_deref(), Some("p.*n"));
+    }
+
+    #[test]
+    fn test_wildcard_to_regex_escapes_literals() {
+        // Interior '-' is a tantivy_fst metachar and must be escaped, exactly
+        // as escape_prefix_to_regex does.
+        assert_eq!(wildcard_to_regex("exp-2*").as_deref(), Some("exp\\-2.*"));
+    }
+
+    #[test]
+    fn test_wildcard_to_regex_pure_wildcard_is_none() {
+        assert_eq!(wildcard_to_regex("**"), None);
+        assert_eq!(wildcard_to_regex("?"), None);
+        assert_eq!(wildcard_to_regex("*?"), None);
+    }
+
+    // ── AMPHTT-847: end-to-end wildcard search against a real in-RAM index ──
+    //
+    // Builds a plain tantivy::Index (no RbIndex / Ruby), registers the query
+    // tokenizer, indexes docs, and drives build_terms_query_core. This is the
+    // Ruby-independent test pattern the AMPHTT-1172 spike evaluates.
+
+    fn build_test_index() -> (tantivy::Index, tantivy::schema::Field) {
+        use tantivy::schema::{Schema, STORED, TEXT};
+        let mut builder = Schema::builder();
+        let content = builder.add_text_field("content", TEXT | STORED);
+        let index = tantivy::Index::create_in_ram(builder.build());
+        let tokenizer = crate::tokenizer::compound::query::CompoundQueryTokenizer::new(
+            crate::tokenizer::default::english_stop_words().to_vec(),
+            rust_stemmers::Algorithm::English,
+        );
+        index.tokenizers().register("ps_query", tokenizer);
+        (index, content)
+    }
+
+    fn index_docs(index: &tantivy::Index, content: tantivy::schema::Field, docs: &[&str]) {
+        let mut writer = index.writer_with_num_threads(1, 30_000_000).unwrap();
+        for text in docs {
+            let mut doc = tantivy::TantivyDocument::default();
+            doc.add_text(content, text);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().unwrap();
+    }
+
+    fn count_hits(index: &tantivy::Index, content: tantivy::schema::Field, query: &str) -> usize {
+        let query = build_terms_query_core(index, query, "ps_query", &[content])
+            .unwrap()
+            .expect("expected a non-empty query");
+        let searcher = index.reader().unwrap().searcher();
+        searcher
+            .search(&*query, &tantivy::collector::Count)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_wildcard_prefix_matches_stem_and_beyond() {
+        let (index, content) = build_test_index();
+        index_docs(
+            &index,
+            content,
+            &["penetration testing", "pending review", "apple pie"],
+        );
+        // pen* → pen.* matches penetration + pending, not apple.
+        assert_eq!(count_hits(&index, content, "pen*"), 2);
+    }
+
+    #[test]
+    fn test_wildcard_question_single_char() {
+        let (index, content) = build_test_index();
+        index_docs(&index, content, &["unit test", "plain text", "many tests"]);
+        // te?t → te.t matches the 4-char "test" and "text", not 5-char "tests".
+        assert_eq!(count_hits(&index, content, "te?t"), 2);
+    }
+
+    #[test]
+    fn test_wildcard_leading() {
+        let (index, content) = build_test_index();
+        index_docs(
+            &index,
+            content,
+            &["a long section", "deep penetration", "apple"],
+        );
+        // *tion → .*tion matches section + penetration.
+        assert_eq!(count_hits(&index, content, "*tion"), 2);
+    }
+
+    #[test]
+    fn test_wildcard_multi_word_is_and() {
+        let (index, content) = build_test_index();
+        index_docs(
+            &index,
+            content,
+            &["penetration document", "penetration apple"],
+        );
+        // pen* doc* requires both (AND default operator).
+        assert_eq!(count_hits(&index, content, "pen* doc*"), 1);
+    }
+
+    #[test]
+    fn test_pure_wildcard_yields_no_query() {
+        let (index, content) = build_test_index();
+        index_docs(&index, content, &["anything at all"]);
+        // ** has no literal char → no clause → no query (never a match-all).
+        let query = build_terms_query_core(&index, "**", "ps_query", &[content]).unwrap();
+        assert!(query.is_none());
+    }
+
     // TODO:: [DEFERRED] Add Ruby-dependent unit tests (requires magnus::embed or Ruby linking)
     // Targets: parse_search_args, resolve_fields, build_full_query, collect_search_results,
-    // marshal_results, build_terms_query, build_phrase_query, owned_value_to_ruby
+    // marshal_results, build_phrase_query, owned_value_to_ruby
+    // Note: build_terms_query is now covered — its core was extracted into the
+    // Ruby-independent build_terms_query_core (tested above against a real
+    // in-RAM tantivy::Index). The functions listed remain Magnus-coupled.
     // Reason: These functions use Magnus types (RHash, Value, Error) or take &RbIndex which is
     // #[magnus::wrap]-annotated. Constructing these in tests causes linker errors due to
     // unresolved Ruby symbols. Needs either embed feature flag or a refactor to accept plain
     // Tantivy types instead of Magnus wrappers.
     // Scope: 3
-    // See: AMPHTT-731
+    // See: AMPHTT-1172
 }
