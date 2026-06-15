@@ -295,4 +295,4 @@ mod tests {
 // Reason: These functions use Magnus types (RHash, Value, Symbol) that require
 // an initialised Ruby VM.
 // Scope: 2
-// See: AMPHTT-731
+// See: AMPHTT-1172

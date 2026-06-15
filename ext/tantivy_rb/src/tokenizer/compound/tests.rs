@@ -785,4 +785,24 @@ mod query_tokenizer_tests {
         let tokens = token_texts("E12345-001");
         assert!(tokens.contains(&"e12345-001".to_string()));
     }
+
+    // =========================================================================
+    // AMPHTT-847: wildcard tokens bypass stemming and emit a single form
+    // =========================================================================
+
+    /// `running*` must stay `running*` — the stemmer would otherwise corrupt it
+    /// to `run*`, silently changing what the user typed. Single emission (no
+    /// stem/original synonym pair).
+    #[test]
+    fn test_wildcard_star_not_stemmed() {
+        let tokens = token_texts("running*");
+        assert_eq!(tokens, vec!["running*".to_string()]);
+    }
+
+    /// `tests?` must stay `tests?` (not `test?`) and be emitted exactly once.
+    #[test]
+    fn test_wildcard_question_not_stemmed() {
+        let tokens = token_texts("tests?");
+        assert_eq!(tokens, vec!["tests?".to_string()]);
+    }
 }
