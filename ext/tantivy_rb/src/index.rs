@@ -418,4 +418,4 @@ mod tests {
 // symbols, causing linker errors in pure-Rust test binaries. Needs either embed feature
 // flag or a refactor to decouple testable logic from the Magnus wrapper.
 // Scope: 3
-// See: AMPHTT-731
+// See: AMPHTT-1172
