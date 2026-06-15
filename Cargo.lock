@@ -1253,6 +1253,7 @@ dependencies = [
  "rb-sys",
  "rust-stemmers",
  "tantivy",
+ "tantivy-query-grammar",
 ]
 
 [[package]]

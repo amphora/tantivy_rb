@@ -25,6 +25,11 @@ rb-sys = "=0.9.124"
 # Exact-pinned: core search engine. Version bumps can change indexing
 # behaviour or on-disk format.
 tantivy = "=0.24.2"
+# Exact-pinned: Tantivy's standalone query-grammar crate (no tantivy dependency
+# itself). Power query (AMPHTT-848) reuses its parser to turn raw search syntax
+# into a UserInputAst, which we lower to a query ourselves — injecting 847
+# wildcards at term leaves. Keep in lockstep with the tantivy version above.
+tantivy-query-grammar = "=0.24.0"
 # Tilde-pinned: non-FFI utility crates. ~x.y.z allows patch-level updates
 # via `cargo update` for security fixes while constraining the minor version.
 rust-stemmers = "~1.2.0"
