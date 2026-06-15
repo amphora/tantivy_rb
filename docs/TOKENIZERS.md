@@ -214,6 +214,16 @@ The query tokenizer preserves `*`, `?`, and `"` characters through the pipeline.
 - `print?` — single-character wildcard search
 - `"exact phrase"` — phrase query (quotes are kept so the search layer can detect and build `PhraseQuery`)
 
+Wildcards are **wired into the search layer** (AMPHTT-847). A token carrying `*`/`?`
+bypasses stemming in this tokenizer (so `running*` stays `running*`, never `run*`)
+and `build_terms_query` turns it into a `RegexQuery`: `*` → `.*`, `?` → `.`, with
+every other character escaped to match literally. Because `RegexQuery` is
+whole-token-anchored this covers both Lucene query types — `pen*` → `pen.*` is a
+prefix query, `te?t` → `te.t` a single-char wildcard, and `*tion` → `.*tion` a
+(supported but slow) leading wildcard. A pure-wildcard token (`**`, `*?`) is
+dropped rather than executed as a match-all. Wildcards inside a quoted phrase are
+**not** expanded — they stay literal, matching Lucene's phrase behaviour.
+
 ### Example walkthrough
 
 Input: `"~0.4 mg/mL in 25:75 methanol:water; prepared E21634-016"`
