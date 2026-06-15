@@ -11,17 +11,21 @@
 //!
 //! Both modes support optional field-level term filters via the `filter:` hash.
 
-use crate::index::{parse_date, RbIndex};
+use crate::index::{parse_date, parse_date_to_timestamp, RbIndex};
 use crate::tokenizer::compound::query::is_wildcard_token;
 use magnus::{prelude::*, r_hash::ForEach, Error, RArray, RHash, RString, Ruby, Symbol, Value};
 use std::ops::Bound;
 use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::query::{
-    BooleanQuery, Occur, PhraseQuery, Query, QueryParser, RangeQuery, RegexQuery, TermQuery,
+    AllQuery, BooleanQuery, BoostQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query, QueryParser,
+    RangeQuery, RegexQuery, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{IndexRecordOption, OwnedValue, Schema};
 use tantivy::tokenizer::TokenStream;
 use tantivy::{DocAddress, Searcher, TantivyDocument};
+use tantivy_query_grammar::{
+    Delimiter, Occur as GrammarOccur, UserInputAst, UserInputBound, UserInputLeaf,
+};
 
 /// Parsed search arguments extracted from Ruby kwargs.
 struct SearchArgs {
@@ -31,6 +35,7 @@ struct SearchArgs {
     limit: usize,
     offset: usize,
     query_tokenizer_name: Option<String>,
+    power_query: bool,
 }
 
 /// Parse Ruby arguments into a `SearchArgs` struct.
@@ -53,6 +58,7 @@ fn parse_search_args(ruby_args: &[Value]) -> Result<SearchArgs, Error> {
     let mut limit: usize = 20;
     let mut offset: usize = 0;
     let mut query_tokenizer_name: Option<String> = None;
+    let mut power_query: bool = false;
 
     if ruby_args.len() > 1 {
         if let Ok(kwargs) = <RHash as magnus::TryConvert>::try_convert(ruby_args[1]) {
@@ -76,6 +82,9 @@ fn parse_search_args(ruby_args: &[Value]) -> Result<SearchArgs, Error> {
             if let Some(qt_val) = kwargs.get(Symbol::new("query_tokenizer")) {
                 query_tokenizer_name = Some(magnus::TryConvert::try_convert(qt_val)?);
             }
+            if let Some(pq_val) = kwargs.get(Symbol::new("power_query")) {
+                power_query = magnus::TryConvert::try_convert(pq_val)?;
+            }
         }
     }
 
@@ -86,6 +95,7 @@ fn parse_search_args(ruby_args: &[Value]) -> Result<SearchArgs, Error> {
         limit,
         offset,
         query_tokenizer_name,
+        power_query,
     })
 }
 
@@ -150,7 +160,19 @@ fn build_full_query(
 ) -> Result<Box<dyn Query>, Error> {
     let schema = rb_index.schema();
 
-    let text_query: Box<dyn Query> = if let Some(ref tokenizer_name) = args.query_tokenizer_name {
+    let text_query: Box<dyn Query> = if args.power_query {
+        // Power query (AMPHTT-848): raw syntax via our grammar-based parser.
+        // Reuses the query tokenizer for term analysis, so a query_tokenizer is
+        // required (the Rails caller passes "ps_query").
+        let tokenizer_name = args.query_tokenizer_name.as_deref().ok_or_else(|| {
+            Error::new(
+                magnus::exception::arg_error(),
+                "power_query: true requires a query_tokenizer",
+            )
+        })?;
+        build_power_query(rb_index.index(), &args.query_string, tokenizer_name, fields)
+            .map_err(|msg| Error::new(magnus::exception::arg_error(), msg))?
+    } else if let Some(ref tokenizer_name) = args.query_tokenizer_name {
         build_tokenized_query(rb_index, &args.query_string, tokenizer_name, fields)?
     } else {
         let query_parser = QueryParser::for_index(rb_index.index(), fields.to_vec());
@@ -847,13 +869,28 @@ fn build_phrase_query(
     tokenizer_name: &str,
     fields: &[tantivy::schema::Field],
 ) -> Result<Option<Box<dyn Query>>, Error> {
-    let tokenizer_manager = rb_index.index().tokenizers();
-    let mut tokenizer = tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
-        Error::new(
-            magnus::exception::arg_error(),
-            format!("Unknown query tokenizer: '{}'", tokenizer_name),
-        )
-    })?;
+    build_phrase_query_core(rb_index.index(), phrase_text, tokenizer_name, fields, false)
+        .map_err(|msg| Error::new(magnus::exception::arg_error(), msg))
+}
+
+/// Ruby-independent core of `build_phrase_query` (mirrors `build_terms_query_core`;
+/// see AMPHTT-847 / AMPHTT-1172).
+///
+/// When `prefix` is set and the phrase has >= 2 terms, builds a
+/// `PhrasePrefixQuery` (the last term matches as a prefix) — used by power query
+/// for `"big bad wo"*` (AMPHTT-848). Returns `None` if the tokenizer produces no
+/// tokens (e.g. all stop words).
+fn build_phrase_query_core(
+    index: &tantivy::Index,
+    phrase_text: &str,
+    tokenizer_name: &str,
+    fields: &[tantivy::schema::Field],
+    prefix: bool,
+) -> Result<Option<Box<dyn Query>>, String> {
+    let tokenizer_manager = index.tokenizers();
+    let mut tokenizer = tokenizer_manager
+        .get(tokenizer_name)
+        .ok_or_else(|| format!("Unknown query tokenizer: '{}'", tokenizer_name))?;
 
     // Collect tokens grouped by position. We only need the first token at each
     // position (the stemmed form) for the phrase query.
@@ -862,7 +899,6 @@ fn build_phrase_query(
         std::collections::BTreeMap::new();
     while token_stream.advance() {
         let tok = token_stream.token();
-        // Take only the first token at each position (stemmed form).
         position_terms
             .entry(tok.position)
             .or_insert_with(|| tok.text.clone());
@@ -874,22 +910,21 @@ fn build_phrase_query(
 
     // Single token — fall back to a term query (phrase needs ≥2 terms).
     if position_terms.len() == 1 {
-        if let Some(token_text) = position_terms.into_values().next() {
-            let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-            for &field in fields {
-                let term = tantivy::Term::from_field_text(field, &token_text);
-                field_clauses.push((
-                    Occur::Should,
-                    Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
-                ));
-            }
-            return Ok(Some(Box::new(BooleanQuery::new(field_clauses))));
-        } else {
+        let Some(token_text) = position_terms.into_values().next() else {
             return Ok(None);
+        };
+        let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for &field in fields {
+            let term = tantivy::Term::from_field_text(field, &token_text);
+            field_clauses.push((
+                Occur::Should,
+                Box::new(TermQuery::new(term, IndexRecordOption::WithFreqs)),
+            ));
         }
+        return Ok(Some(Box::new(BooleanQuery::new(field_clauses))));
     }
 
-    // Build a PhraseQuery per field, OR'd together.
+    // Build a (PhrasePrefix)Query per field, OR'd together.
     let ordered_texts: Vec<String> = position_terms.into_values().collect();
     let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
@@ -898,7 +933,12 @@ fn build_phrase_query(
             .iter()
             .map(|text| tantivy::Term::from_field_text(field, text))
             .collect();
-        field_clauses.push((Occur::Should, Box::new(PhraseQuery::new(terms))));
+        let query: Box<dyn Query> = if prefix {
+            Box::new(PhrasePrefixQuery::new(terms))
+        } else {
+            Box::new(PhraseQuery::new(terms))
+        };
+        field_clauses.push((Occur::Should, query));
     }
 
     Ok(Some(Box::new(BooleanQuery::new(field_clauses))))
@@ -1055,6 +1095,220 @@ fn build_terms_query_core(
     }
 
     Ok(Some(Box::new(BooleanQuery::new(position_clauses))))
+}
+
+// ===========================================================================
+// Power query (AMPHTT-848): raw search syntax via Tantivy's query grammar.
+//
+// Unlike the content path (which strips operators through the tokenizer), power
+// query passes input UNESCAPED to `tantivy_query_grammar::parse_query`, then we
+// lower the resulting `UserInputAst` to a query ourselves. This recovers Java's
+// `makePowerQuery` parity: boolean / field-scoped / grouped / range syntax AND
+// bare-term wildcards (`pen*`, `te?t`) in one engine — the latter because each
+// term leaf is lowered through `build_terms_query_core`, which already turns
+// `*`/`?` into a `RegexQuery` (847). Stock tantivy `QueryParser` cannot do
+// bare-term wildcards, which is why we own the lowering.
+// ===========================================================================
+
+/// Build a query from raw power-query syntax. Ruby-independent (plain `&Index`,
+/// `String` errors) like `build_terms_query_core`.
+fn build_power_query(
+    index: &tantivy::Index,
+    query_string: &str,
+    tokenizer_name: &str,
+    fields: &[tantivy::schema::Field],
+) -> Result<Box<dyn Query>, String> {
+    let ast = tantivy_query_grammar::parse_query(query_string)
+        .map_err(|_| format!("Invalid power query syntax: '{}'", query_string))?;
+    Ok(lower_power_ast(index, &ast, tokenizer_name, fields)?
+        .unwrap_or_else(|| Box::new(tantivy::query::EmptyQuery)))
+}
+
+/// Lower a grammar `UserInputAst` into a Tantivy query.
+///
+/// `None` means the node produced no clause (e.g. a literal that tokenised to
+/// nothing — all stop words); callers treat a fully-empty query as match-nothing.
+fn lower_power_ast(
+    index: &tantivy::Index,
+    ast: &UserInputAst,
+    tokenizer_name: &str,
+    default_fields: &[tantivy::schema::Field],
+) -> Result<Option<Box<dyn Query>>, String> {
+    match ast {
+        UserInputAst::Clause(items) => {
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+            for (occur_opt, sub) in items {
+                let Some(query) = lower_power_ast(index, sub, tokenizer_name, default_fields)?
+                else {
+                    continue;
+                };
+                // Default operator is AND (Java `setDefaultOperator(AND)`): an
+                // unmarked clause is required.
+                let occur = match occur_opt {
+                    Some(GrammarOccur::Must) | None => Occur::Must,
+                    Some(GrammarOccur::Should) => Occur::Should,
+                    Some(GrammarOccur::MustNot) => Occur::MustNot,
+                };
+                clauses.push((occur, query));
+            }
+            if clauses.is_empty() {
+                return Ok(None);
+            }
+            // A clause with only negative (MustNot) terms — e.g. `NOT apple`, or
+            // the `NOT apple` half of `x AND NOT apple` that the grammar nests —
+            // is meaningless to a search engine on its own. Rather than error
+            // (Lucene's strict behaviour), inject a match-all positive so it
+            // reads as "everything except apple". This also makes nested
+            // negatives in larger queries Just Work.
+            let has_positive = clauses
+                .iter()
+                .any(|(occur, _)| matches!(occur, Occur::Must | Occur::Should));
+            if !has_positive {
+                clauses.insert(0, (Occur::Must, Box::new(AllQuery)));
+            }
+            Ok(Some(Box::new(BooleanQuery::new(clauses))))
+        }
+        UserInputAst::Boost(inner, boost) => {
+            match lower_power_ast(index, inner, tokenizer_name, default_fields)? {
+                Some(query) => Ok(Some(Box::new(BoostQuery::new(query, *boost as f32)))),
+                None => Ok(None),
+            }
+        }
+        UserInputAst::Leaf(leaf) => lower_power_leaf(index, leaf, tokenizer_name, default_fields),
+    }
+}
+
+/// Lower a single grammar leaf. Term leaves are delegated to the same per-leaf
+/// builders the content path uses, so power-query terms get identical analysis
+/// (`ps_query` stemming/dual-emit) and 847 wildcard handling.
+fn lower_power_leaf(
+    index: &tantivy::Index,
+    leaf: &UserInputLeaf,
+    tokenizer_name: &str,
+    default_fields: &[tantivy::schema::Field],
+) -> Result<Option<Box<dyn Query>>, String> {
+    match leaf {
+        UserInputLeaf::Literal(lit) => {
+            let fields = resolve_power_fields(index, default_fields, lit.field_name.as_deref())?;
+            match lit.delimiter {
+                Delimiter::None => {
+                    // Re-attach a trailing `*` the grammar consumed into `prefix`
+                    // so build_terms_query_core's 847 path builds the prefix
+                    // RegexQuery. Embedded `?`/`*` already survive in `phrase`.
+                    let text = if lit.prefix {
+                        format!("{}*", lit.phrase)
+                    } else {
+                        lit.phrase.clone()
+                    };
+                    // auto_prefix_last = false: power-query terms are explicit;
+                    // only the content box auto-prefixes (AMPHTT-849).
+                    build_terms_query_core(index, &text, tokenizer_name, &fields, false)
+                }
+                Delimiter::SingleQuotes | Delimiter::DoubleQuotes => {
+                    build_phrase_query_core(index, &lit.phrase, tokenizer_name, &fields, lit.prefix)
+                }
+            }
+        }
+        UserInputLeaf::All => Ok(Some(Box::new(AllQuery))),
+        UserInputLeaf::Range {
+            field,
+            lower,
+            upper,
+        } => build_power_range(index, field.as_deref(), lower, upper).map(Some),
+        UserInputLeaf::Set { field, elements } => {
+            let fields = resolve_power_fields(index, default_fields, field.as_deref())?;
+            let mut terms: Vec<tantivy::Term> = Vec::new();
+            for element in elements {
+                for &field in &fields {
+                    terms.push(tantivy::Term::from_field_text(field, element));
+                }
+            }
+            if terms.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(Box::new(TermSetQuery::new(terms))))
+        }
+        // Tantivy's ExistsQuery requires a fast/columnar field; our text fields
+        // are not fast, so `field:*` cannot be answered. Documented divergence
+        // from Lucene (AMPHTT-848 plan, Decision 6).
+        UserInputLeaf::Exists { field } => Err(format!(
+            "Power query 'exists' ({}:*) is not supported on text fields",
+            field
+        )),
+    }
+}
+
+/// Resolve the field(s) a power-query leaf targets: a named field (must exist)
+/// or, when unscoped, all default searchable fields.
+fn resolve_power_fields(
+    index: &tantivy::Index,
+    default_fields: &[tantivy::schema::Field],
+    field_name: Option<&str>,
+) -> Result<Vec<tantivy::schema::Field>, String> {
+    match field_name {
+        None => Ok(default_fields.to_vec()),
+        Some(name) => index
+            .schema()
+            .get_field(name)
+            .map(|field| vec![field])
+            .map_err(|_| format!("Unknown field in power query: '{}'", name)),
+    }
+}
+
+/// Build a `RangeQuery` for `field:[lo TO hi]`. Date fields parse bounds as
+/// dates; text fields use lexical term bounds. A range needs an explicit field.
+fn build_power_range(
+    index: &tantivy::Index,
+    field_name: Option<&str>,
+    lower: &UserInputBound,
+    upper: &UserInputBound,
+) -> Result<Box<dyn Query>, String> {
+    let name = field_name
+        .ok_or_else(|| "Range query requires a field, e.g. created_at:[a TO b]".to_string())?;
+    let schema = index.schema();
+    let field = schema
+        .get_field(name)
+        .map_err(|_| format!("Unknown field in range query: '{}'", name))?;
+    match schema.get_field_entry(field).field_type() {
+        tantivy::schema::FieldType::Date(_) => {
+            let lo = date_range_bound(field, lower)?;
+            let hi = date_range_bound(field, upper)?;
+            Ok(Box::new(RangeQuery::new(lo, hi)))
+        }
+        tantivy::schema::FieldType::Str(_) => {
+            let lo = text_range_bound(field, lower);
+            let hi = text_range_bound(field, upper);
+            Ok(Box::new(RangeQuery::new(lo, hi)))
+        }
+        _ => Err(format!(
+            "Range query on field '{}' requires a date or text field",
+            name
+        )),
+    }
+}
+
+fn date_range_bound(
+    field: tantivy::schema::Field,
+    bound: &UserInputBound,
+) -> Result<Bound<tantivy::Term>, String> {
+    let make = |s: &str| -> Result<tantivy::Term, String> {
+        let ts = parse_date_to_timestamp(s)?;
+        let dt = tantivy::DateTime::from_timestamp_secs(ts);
+        Ok(tantivy::Term::from_field_date_for_search(field, dt))
+    };
+    Ok(match bound {
+        UserInputBound::Inclusive(s) => Bound::Included(make(s)?),
+        UserInputBound::Exclusive(s) => Bound::Excluded(make(s)?),
+        UserInputBound::Unbounded => Bound::Unbounded,
+    })
+}
+
+fn text_range_bound(field: tantivy::schema::Field, bound: &UserInputBound) -> Bound<tantivy::Term> {
+    match bound {
+        UserInputBound::Inclusive(s) => Bound::Included(tantivy::Term::from_field_text(field, s)),
+        UserInputBound::Exclusive(s) => Bound::Excluded(tantivy::Term::from_field_text(field, s)),
+        UserInputBound::Unbounded => Bound::Unbounded,
+    }
 }
 
 /// Convert a Tantivy `OwnedValue` (from a stored field) into a Ruby `Value`.
@@ -1420,12 +1674,147 @@ mod tests {
         assert_eq!(count_hits(&index, content, "pen", false), 0);
     }
 
+    // ── AMPHTT-848: power query (grammar-based raw syntax) ──────────────────
+    //
+    // A multi-field index (title + summary text, created_at date), the same
+    // ps_index/ps_query setup SearchService uses, exercised via build_power_query.
+
+    fn build_power_index() -> (tantivy::Index, Vec<tantivy::schema::Field>) {
+        use tantivy::schema::{Schema, INDEXED, STORED, TEXT};
+        let mut builder = Schema::builder();
+        let title = builder.add_text_field("title", TEXT | STORED);
+        let summary = builder.add_text_field("summary", TEXT | STORED);
+        let _created_at = builder.add_date_field("created_at", STORED | INDEXED);
+        let index = tantivy::Index::create_in_ram(builder.build());
+        let tokenizer = crate::tokenizer::compound::query::CompoundQueryTokenizer::new(
+            crate::tokenizer::default::english_stop_words().to_vec(),
+            rust_stemmers::Algorithm::English,
+        );
+        index.tokenizers().register("ps_query", tokenizer);
+        (index, vec![title, summary])
+    }
+
+    fn add_power_doc(index: &tantivy::Index, title: &str, summary: &str, created_secs: i64) {
+        let schema = index.schema();
+        let t = schema.get_field("title").unwrap();
+        let s = schema.get_field("summary").unwrap();
+        let c = schema.get_field("created_at").unwrap();
+        let mut writer = index.writer_with_num_threads(1, 30_000_000).unwrap();
+        let mut doc = tantivy::TantivyDocument::default();
+        doc.add_text(t, title);
+        doc.add_text(s, summary);
+        doc.add_date(c, tantivy::DateTime::from_timestamp_secs(created_secs));
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+    }
+
+    fn power_count(
+        index: &tantivy::Index,
+        fields: &[tantivy::schema::Field],
+        query: &str,
+    ) -> usize {
+        let q = build_power_query(index, query, "ps_query", fields).unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        searcher.search(&*q, &tantivy::collector::Count).unwrap()
+    }
+
+    fn seed_power(index: &tantivy::Index) {
+        // A: title penetration, summary alpha | B: title beta, summary annual report
+        // C: title apple, summary gamma
+        add_power_doc(index, "penetration testing", "alpha notes", 1_590_000_000); // 2020
+        add_power_doc(index, "beta release", "annual report", 1_620_000_000); // 2021
+        add_power_doc(index, "apple device", "gamma data", 1_550_000_000); // 2019
+    }
+
+    #[test]
+    fn test_power_combined_field_wildcard_or() {
+        // THE parity case stock QueryParser cannot do: field-scoped + bare
+        // wildcard + boolean OR. title:pen* OR summary:report → A (title pen*)
+        // and B (summary report), not C.
+        let (index, fields) = build_power_index();
+        seed_power(&index);
+        assert_eq!(
+            power_count(&index, &fields, "title:pen* OR summary:report"),
+            2
+        );
+    }
+
+    #[test]
+    fn test_power_and_is_default() {
+        // Space = AND (Java parity). No single doc has both title:pen* and
+        // summary:report, so AND → 0 while OR → 2.
+        let (index, fields) = build_power_index();
+        seed_power(&index);
+        assert_eq!(power_count(&index, &fields, "title:pen* summary:report"), 0);
+    }
+
+    #[test]
+    fn test_power_field_scoping() {
+        // summary:alpha matches A; title:alpha matches nothing (alpha is in
+        // summary, not title) — proves field scoping.
+        let (index, fields) = build_power_index();
+        seed_power(&index);
+        assert_eq!(power_count(&index, &fields, "summary:alpha"), 1);
+        assert_eq!(power_count(&index, &fields, "title:alpha"), 0);
+    }
+
+    #[test]
+    fn test_power_grouping_and_not() {
+        // (penetration OR beta) AND NOT apple → A and B, not C (C excluded, and
+        // C wouldn't match the group anyway). Exercises grouping + MustNot.
+        let (index, fields) = build_power_index();
+        seed_power(&index);
+        assert_eq!(
+            power_count(&index, &fields, "(penetration OR beta) AND NOT apple"),
+            2
+        );
+    }
+
+    #[test]
+    fn test_power_date_range() {
+        // created_at:[2020-01-01 TO 2020-12-31] → only A (2020).
+        let (index, fields) = build_power_index();
+        seed_power(&index);
+        assert_eq!(
+            power_count(&index, &fields, "created_at:[2020-01-01 TO 2020-12-31]"),
+            1
+        );
+    }
+
+    #[test]
+    fn test_power_phrase() {
+        // Quoted phrase stays exact: "annual report" matches B.
+        let (index, fields) = build_power_index();
+        seed_power(&index);
+        assert_eq!(power_count(&index, &fields, "\"annual report\""), 1);
+    }
+
+    #[test]
+    fn test_power_exists_rejected() {
+        // field:* (exists) is unsupported on non-fast text fields → Err.
+        let (index, fields) = build_power_index();
+        seed_power(&index);
+        assert!(build_power_query(&index, "title:*", "ps_query", &fields).is_err());
+    }
+
+    #[test]
+    fn test_power_only_negative_matches_complement() {
+        // `NOT apple` reads as "everything except apple" (match-all injected),
+        // so it matches A and B but not C. (Lucene would reject this; we treat
+        // it as the complement — see plan Decision 4 / divergences.)
+        let (index, fields) = build_power_index();
+        seed_power(&index);
+        assert_eq!(power_count(&index, &fields, "NOT apple"), 2);
+    }
+
     // TODO:: [DEFERRED] Add Ruby-dependent unit tests (requires magnus::embed or Ruby linking)
     // Targets: parse_search_args, resolve_fields, build_full_query, collect_search_results,
-    // marshal_results, build_phrase_query, owned_value_to_ruby
-    // Note: build_terms_query is now covered — its core was extracted into the
-    // Ruby-independent build_terms_query_core (tested above against a real
-    // in-RAM tantivy::Index). The functions listed remain Magnus-coupled.
+    // marshal_results, owned_value_to_ruby
+    // Note: build_terms_query, build_phrase_query, and build_power_query are now
+    // covered — their cores were extracted as Ruby-independent
+    // build_terms_query_core / build_phrase_query_core / build_power_query
+    // (tested above against a real in-RAM tantivy::Index). The functions listed
+    // remain Magnus-coupled.
     // Reason: These functions use Magnus types (RHash, Value, Error) or take &RbIndex which is
     // #[magnus::wrap]-annotated. Constructing these in tests causes linker errors due to
     // unresolved Ruby symbols. Needs either embed feature flag or a refactor to accept plain
